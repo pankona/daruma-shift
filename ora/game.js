@@ -7,12 +7,12 @@
   // ---- 調整値 ----
   const W = 960;
   const H = 540;
-  const TIMESTOP_MS = 5000; // 時間停止フェイズの長さ（実時間）
-  const ENEMY_HP = 24; // 敵だるまが破裂するまでの打数
+  const TIMESTOP_MS = 4000; // 時間停止フェイズの長さ（実時間）
+  const ENEMY_HP = 48; // 敵だるまが破裂するまでの打数
   const PLAYER_HP = 6; // 自だるまが破裂するまでの被弾数
   const PUNCH_INTERVAL_MS = 60; // 再生フェイズで拳を繰り出す間隔
-  const PROJ_BASE = 3; // 飛来物の数 = PROJ_BASE + floor(turn / 2)、上限 PROJ_MAX
-  const PROJ_MAX = 9;
+  const PROJ_BASE = 4; // 飛来物の数 = PROJ_BASE + turn、上限 PROJ_MAX
+  const PROJ_MAX = 14;
   const ATTACK_MS = 750; // 飛来物が奥から出て止まるまでの時間
   const FREEZE_Z = 0.6; // 時間停止時の奥行き（0 = 敵の位置、1 = プレイヤーの顔）
   const ADVANCE_Z = 0.85; // 再生中に迎撃されなかった飛来物が近づく奥行き
@@ -496,13 +496,13 @@
   }
 
   function projectileCount(t) {
-    return Math.min(PROJ_MAX, PROJ_BASE + Math.floor(t / 2));
+    return Math.min(PROJ_MAX, PROJ_BASE + Math.floor((t * 2) / 3));
   }
 
   function spawnProjectiles() {
     const rng = mulberry32(hash3(turn, 7919, 13));
     const slots = [];
-    for (const x of [110, 360, 600, 850]) for (const y of [60, 262, 470]) slots.push({ x, y });
+    for (const x of [90, 290, 480, 670, 870]) for (const y of [60, 262, 470]) slots.push({ x, y });
     for (let i = slots.length - 1; i > 0; i--) {
       const j = Math.floor(rng() * (i + 1));
       const tmp = slots[i];
@@ -744,7 +744,7 @@
     let best = null;
     let bestScore = 1;
     for (const p of projectiles) {
-      if (!p.alive) continue;
+      if (!p.alive || p.marked) continue;
       const pos = projPos(p);
       const score = Math.hypot(x - pos.x, y - pos.y) / (projRadius(p) + 10);
       if (score <= bestScore) {
@@ -753,7 +753,6 @@
       }
     }
     if (best) {
-      if (best.marked) return 'already';
       best.marked = true;
       queue.push({ type: 'proj', id: best.id });
       const pos = projPos(best);
