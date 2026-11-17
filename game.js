@@ -27,7 +27,6 @@
   const REST_SPEED = 0.12;
   const REST_ANGULAR = 0.012;
   const REST_FRAMES_EVAL = 45; // 静止がこのフレーム数続いたら評価
-  const REST_FRAMES_AIM = 20; // 静止がこのフレーム数続いたら狙える
   const EVAL_TIMEOUT_STEPS = 6 * 60; // 叩いてから6秒で評価
 
   const WORRY_ANGLE = 0.35;
@@ -292,12 +291,9 @@
     }
   }
 
-  function isAtRest() {
-    return restFrames >= REST_FRAMES_AIM;
-  }
-
+  // 静止を待たずに狙える。結果が出たあとと、すでに狙い中のときだけ不可
   function canAim() {
-    return phase === 'ready' && isAtRest();
+    return phase === 'ready' || phase === 'moving';
   }
 
   // 段が台（stage の stackOn の台）の上から無くなったか
@@ -409,7 +405,8 @@
     if (!canAim()) return false;
     const b = blockAt(x, y);
     if (!b) return false;
-    aim = { block: b, startX: x, startY: y, curX: x, curY: y, pointerId };
+    // prevPhase：キャンセル時に戻す phase（'moving' 中の評価待ちを壊さないため）
+    aim = { block: b, startX: x, startY: y, curX: x, curY: y, pointerId, prevPhase: phase };
     phase = 'aiming'; // この間は物理を止める
     return true;
   }
@@ -424,15 +421,16 @@
     if (!aim) return;
     const v = aimVector();
     const b = aim.block;
+    const prevPhase = aim.prevPhase;
     aim = null;
-    phase = 'ready';
+    phase = prevPhase;
     if (v && !v.cancel) applyStrike(b, v.dir.x, v.dir.y, v.power);
   }
 
   function cancelAim() {
     if (!aim) return;
+    phase = aim.prevPhase;
     aim = null;
-    phase = 'ready';
   }
 
   // ---- 描画 ----------------------------------------------------------
@@ -855,7 +853,7 @@
 
   window.__game = {
     // 段を番号（下から0始まり）で指定して叩く。dirX/dirY は向き、power は 0〜1。
-    // 通常の操作と同じく、全ボディが静止していないと叩けない（false を返す）。
+    // 通常の操作と同じく、動いている最中でも叩ける。結果が出たあと（won/lost）は叩けない（false を返す）。
     strike(index, dirX, dirY, power) {
       const b = blocks[index];
       if (!b || b.removed || !canAim()) return false;
