@@ -53,16 +53,22 @@
   const darumaImage = new Image();
   let darumaImageReady = false;
   let darumaArtBox = null; // 画像内の「絵がある範囲」{x, y, w, h}（実ピクセル）
-  // 目入れ用：画像の目の位置（画像の画素座標）。x, y は中心、rx, ry は目の範囲の半径、r は入れる瞳の半径。
-  // 画素が読めないとき（file:// で開いた場合など、canvas が汚染されて getImageData が失敗する）は
-  // 目視で決めた概算値を使い、顔色の楕円を重ねて元の目を隠す。
-  const EYE_FALLBACK = [
-    { x: 40, y: 45, rx: 6.5, ry: 6.5, r: 4 },
-    { x: 56, y: 45, rx: 6.5, ry: 6.5, r: 4 },
+  // 目入れ用：assets/daruma.png の目の位置（この素材専用の固定値。画像の画素座標で、x, y は中心の画素、
+  // rx, ry は目の範囲（渦巻き模様の目全体）の半径、r は入れる瞳の半径）。
+  // 素材の目は渦巻き模様の大きな目で、暗い画素は x 24-44 / 48-68、y 35-45 に広がる（2026-11-17 実測）。
+  // 自動検出は口の両脇の頬の渦模様を目と誤認したため使わない。
+  // 「目なし」のスプライトも、画素が読めないときの代替の楕円も、同じこの幾何を使う。
+  const EYE_RX = 12;
+  const EYE_RY = 8.5;
+  const EYE_PUPIL_R = 0.7 * Math.min(EYE_RX, EYE_RY); // 5.95
+  const DARUMA_EYES = [
+    { x: 34, y: 41, rx: EYE_RX, ry: EYE_RY, r: EYE_PUPIL_R }, // 向かって左
+    { x: 58, y: 41, rx: EYE_RX, ry: EYE_RY, r: EYE_PUPIL_R }, // 向かって右
   ];
-  let darumaEyes = EYE_FALLBACK; // [向かって左, 向かって右]
+  // 画素 (x, y) の中心は (x + 0.5, y + 0.5)。描画もスプライトの塗りもこの連続座標を使う
+  const eyeCenter = (e) => ({ x: e.x + 0.5, y: e.y + 0.5 });
   let darumaFaceColor = '#fffcf5'; // 目を隠す顔色（画素が読めれば顔の最頻色に置き換える）
-  let darumaSprite = null; // 目の画素を顔色で消した複製（画素が読めたときだけ）
+  let darumaSprite = null; // 目の楕円を顔色で塗りつぶした複製（画素が読めたときだけ）
   darumaImage.onload = function () {
     let px = null;
     try {
@@ -72,15 +78,14 @@
       darumaArtBox = null; // 測れなければ画像全体を使う
     }
     if (px) {
+      // 画素が読めないとき（file:// で開いた場合など、canvas が汚染されて getImageData が失敗する）は
+      // ここを通らず、描画時に同じ楕円を顔色で重ねて元の目を隠す
       try {
-        const found = findEyes(px);
-        if (found) {
-          darumaEyes = found.eyes;
-          darumaFaceColor = found.face;
-          darumaSprite = makeBlankSprite(px, found);
-        }
+        const faceRGB = measureFaceColor(px) || [255, 252, 245];
+        darumaFaceColor = `rgb(${faceRGB[0]},${faceRGB[1]},${faceRGB[2]})`;
+        darumaSprite = makeBlankSprite(px, faceRGB);
       } catch (e) {
-        darumaSprite = null; // 見つからなければ概算値＋楕円のまま
+        darumaSprite = null;
       }
     }
     darumaImageReady = true;
@@ -117,11 +122,7 @@
     return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
   }
 
-  // 画像の画素から目の位置を測る。
-  // 顔（白っぽい画素）の枠の中にある墨の塊を連結成分に分け、白を囲んでいる（縁取りのある）丸い塊、
-  // なければ丸い塊のうち、顔の中心をはさんで左右に対で並ぶものを目とみなす。
-  // 返り値：{ eyes: [左, 右], face: 顔色の文字列, faceRGB: [r, g, b] }。見つからなければ null。
-  // mask が 1 の画素を 4近傍でつないだ連結成分（枠 [bx0,bx1]×[by0,by1] の中だけ見る）
+  // mask が 1 の画素を 4近傍でつないだ連結成分（枠 [bx0,bx1]×[by0,by1] の中だけ見る）。顔の領域を取るのに使う
   function labelComponents(mask, w, bx0, by0, bx1, by1) {
     const label = new Int32Array(mask.length); // 0 = 未割り当て
     const comps = [];
@@ -158,27 +159,19 @@
     return { label, comps };
   }
 
-  function findEyes(px) {
+  // 顔の色：顔（いちばん大きい白っぽい連結成分。体のつやなど小さな白は無視する）の画素の最頻色。
+  // 返り値は [r, g, b]。白っぽい画素が無ければ null
+  function measureFaceColor(px) {
     const { w, h, data } = px;
     const n = w * h;
-    const dark = new Uint8Array(n); // 墨：輝度 80 未満
-    const white = new Uint8Array(n); // 白っぽい：顔と目の白
+    const white = new Uint8Array(n);
     for (let k = 0; k < n; k++) {
       const i = k * 4;
       if (data[i + 3] <= 8) continue;
-      const r = data[i], g = data[i + 1], b = data[i + 2];
-      if ((r + g + b) / 3 < 80) dark[k] = 1;
-      else if (r > 185 && g > 185 && b > 165) white[k] = 1;
+      if (data[i] > 185 && data[i + 1] > 185 && data[i + 2] > 165) white[k] = 1;
     }
-
-    // 顔：いちばん大きい白の連結成分（体のつやなど、小さな白は無視する）
     const faceComp = labelComponents(white, w, 0, 0, w - 1, h - 1).comps.sort((a, b) => b.area - a.area)[0];
     if (!faceComp) return null;
-    const fx0 = faceComp.x0, fy0 = faceComp.y0, fx1 = faceComp.x1, fy1 = faceComp.y1;
-    const faceW = fx1 - fx0 + 1;
-    const faceH = fy1 - fy0 + 1;
-    const faceCx = (fx0 + fx1 + 1) / 2;
-    // 顔の色：顔の画素の最頻色
     const faceColors = new Map();
     for (const k of faceComp.pixels) {
       const i = k * 4;
@@ -192,143 +185,34 @@
         faceKey = key;
       }
     }
-    const faceRGB = [(faceKey >> 16) & 255, (faceKey >> 8) & 255, faceKey & 255];
-
-    // 顔の枠（1px 広げる）の中の墨の連結成分
-    const bx0 = Math.max(0, fx0 - 1), by0 = Math.max(0, fy0 - 1);
-    const bx1 = Math.min(w - 1, fx1 + 1), by1 = Math.min(h - 1, fy1 + 1);
-    const { label, comps } = labelComponents(dark, w, bx0, by0, bx1, by1);
-
-    // 各成分が囲んでいる画素：成分の枠の縁から成分以外の画素をたどり、届かなかった画素
-    for (const c of comps) {
-      const ex0 = Math.max(0, c.x0 - 1), ey0 = Math.max(0, c.y0 - 1);
-      const ex1 = Math.min(w - 1, c.x1 + 1), ey1 = Math.min(h - 1, c.y1 + 1);
-      const seen = new Set();
-      const stack = [];
-      const push = (x, y) => {
-        const k = y * w + x;
-        if (label[k] === c.id || seen.has(k)) return;
-        seen.add(k);
-        stack.push(k);
-      };
-      for (let x = ex0; x <= ex1; x++) {
-        push(x, ey0);
-        push(x, ey1);
-      }
-      for (let y = ey0; y <= ey1; y++) {
-        push(ex0, y);
-        push(ex1, y);
-      }
-      while (stack.length) {
-        const q = stack.pop();
-        const qx = q % w;
-        const qy = (q - qx) / w;
-        if (qx > ex0) push(qx - 1, qy);
-        if (qx < ex1) push(qx + 1, qy);
-        if (qy > ey0) push(qx, qy - 1);
-        if (qy < ey1) push(qx, qy + 1);
-      }
-      c.enclosed = [];
-      for (let y = ey0; y <= ey1; y++) {
-        for (let x = ex0; x <= ex1; x++) {
-          const k = y * w + x;
-          if (label[k] !== c.id && !seen.has(k)) c.enclosed.push(k);
-        }
-      }
-      c.w = c.x1 - c.x0 + 1;
-      c.h = c.y1 - c.y0 + 1;
-      c.cx = (c.x0 + c.x1 + 1) / 2;
-      c.cy = (c.y0 + c.y1 + 1) / 2;
-    }
-
-    const cands = comps.filter((c) => c.area <= (faceW * faceH) / 3 && c.w >= 2 && c.h >= 2);
-    const round = (c) => c.w / c.h >= 0.5 && c.w / c.h <= 2;
-    // 左右の対：横に離れ、高さがそろい、大きさが近く、中点が顔の中心の近く
-    function pairs(list) {
-      const out = [];
-      for (const a of list) {
-        for (const b of list) {
-          if (a.cx >= b.cx || a.x1 >= b.x0) continue;
-          if (Math.abs(a.cy - b.cy) > Math.max(a.h, b.h)) continue;
-          if (Math.max(a.area, b.area) / Math.min(a.area, b.area) > 2.5) continue;
-          if (Math.abs((a.cx + b.cx) / 2 - faceCx) > faceW * 0.15) continue;
-          out.push([a, b]);
-        }
-      }
-      return out;
-    }
-    let ps = pairs(cands.filter((c) => c.enclosed.length > 0 && round(c)));
-    let solid = false; // 縁取りのない塗りつぶしの目
-    if (!ps.length) {
-      ps = pairs(cands.filter(round));
-      solid = true;
-    }
-    let best = null;
-    for (const p of ps) {
-      const score = p[0].area + p[1].area + p[0].enclosed.length + p[1].enclosed.length;
-      if (!best || score > best.score) best = { pair: p, score };
-    }
-    if (!best) return null;
-
-    // 目の範囲：成分＋囲んだ画素＋成分の枠の中にある小さな墨の塊（縁取りが開いていて囲めなかった瞳など）。
-    // 枠に少しかかる大きな塊（眉の端）は巻き込まない
-    const eyes = best.pair.map((c) => {
-      const region = new Set(c.pixels);
-      for (const k of c.enclosed) region.add(k);
-      for (let y = c.y0; y <= c.y1; y++) {
-        for (let x = c.x0; x <= c.x1; x++) {
-          const k = y * w + x;
-          if (!dark[k] || label[k] === c.id) continue;
-          const other = label[k] ? comps[label[k] - 1] : null;
-          if (other && other.area < c.area * 0.6) region.add(k);
-        }
-      }
-      let x0 = w, y0 = h, x1 = -1, y1 = -1;
-      for (const k of region) {
-        const x = k % w;
-        const y = (k - x) / w;
-        if (x < x0) x0 = x;
-        if (x > x1) x1 = x;
-        if (y < y0) y0 = y;
-        if (y > y1) y1 = y;
-      }
-      const rx = (x1 - x0 + 1) / 2;
-      const ry = (y1 - y0 + 1) / 2;
-      return {
-        x: (x0 + x1 + 1) / 2,
-        y: (y0 + y1 + 1) / 2,
-        rx,
-        ry,
-        r: Math.max(1.5, (solid ? 0.8 : 0.6) * Math.min(rx, ry)),
-        region,
-      };
-    });
-    // 妥当性：丸い、大きさが近い、高さがそろう。外れていたら概算値に任せる
-    for (const e of eyes) {
-      const asp = e.rx / e.ry;
-      if (asp < 0.55 || asp > 1.8 || e.rx < 2 || e.rx > faceW * 0.3) return null;
-    }
-    if (Math.abs(eyes[0].y - eyes[1].y) > 3) return null;
-    if (Math.max(eyes[0].rx, eyes[1].rx) / Math.min(eyes[0].rx, eyes[1].rx) > 1.6) return null;
-    return { eyes, face: `rgb(${faceRGB[0]},${faceRGB[1]},${faceRGB[2]})`, faceRGB };
+    return [(faceKey >> 16) & 255, (faceKey >> 8) & 255, faceKey & 255];
   }
 
-  // 目の画素を顔色で塗りつぶした複製を作る（「まだ目が入っていない」だるま）
-  function makeBlankSprite(px, found) {
+  // 目の楕円（DARUMA_EYES の中心・rx・ry）の内側を顔色で塗りつぶした複製を作る（「まだ目が入っていない」だるま）。
+  // 渦巻きの白い隙間も含めて楕円の内側を全部塗るので、きれいな顔色の楕円が残る
+  function makeBlankSprite(px, faceRGB) {
     const c = document.createElement('canvas');
     c.width = px.w;
     c.height = px.h;
     const g = c.getContext('2d');
     const id = g.createImageData(px.w, px.h);
     id.data.set(px.data);
-    const [r, gg, b] = found.faceRGB;
-    for (const e of found.eyes) {
-      for (const k of e.region) {
-        const i = k * 4;
-        id.data[i] = r;
-        id.data[i + 1] = gg;
-        id.data[i + 2] = b;
-        id.data[i + 3] = 255;
+    const [r, gg, b] = faceRGB;
+    for (const e of DARUMA_EYES) {
+      const { x: cx, y: cy } = eyeCenter(e);
+      const x0 = Math.max(0, Math.floor(cx - e.rx)), x1 = Math.min(px.w - 1, Math.ceil(cx + e.rx));
+      const y0 = Math.max(0, Math.floor(cy - e.ry)), y1 = Math.min(px.h - 1, Math.ceil(cy + e.ry));
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const u = (x + 0.5 - cx) / e.rx;
+          const v = (y + 0.5 - cy) / e.ry;
+          if (u * u + v * v > 1) continue;
+          const i = (y * px.w + x) * 4;
+          id.data[i] = r;
+          id.data[i + 1] = gg;
+          id.data[i + 2] = b;
+          id.data[i + 3] = 255;
+        }
       }
     }
     g.putImageData(id, 0, 0);
@@ -990,15 +874,19 @@
     ctx.save();
     applyDarumaTransform(ctx, body);
     ctx.imageSmoothingEnabled = false; // ドット絵をくっきり見せる
-    // 目の画素を消した複製があればそれを、なければ元の絵を描いて目の上に顔色の楕円を重ねる
+    // 目の楕円を顔色で消した複製があればそれを、なければ元の絵を描いて同じ楕円を顔色で重ねる
+    // （どちらも DARUMA_EYES の幾何。重ねる楕円だけ、拡大時の縁のにじみを隠すため 0.5px 広げる）
     ctx.drawImage(darumaSprite || img, dx, dy, dw, dh);
-    const eyes = darumaEyes.map((e) => ({
-      x: dx + e.x * scale,
-      y: dy + e.y * scale,
-      r: e.r * scale,
-      mx: (e.rx + 1) * scale,
-      my: (e.ry + 1) * scale,
-    }));
+    const eyes = DARUMA_EYES.map((e) => {
+      const c = eyeCenter(e);
+      return {
+        x: dx + c.x * scale,
+        y: dy + c.y * scale,
+        r: e.r * scale,
+        mx: (e.rx + 0.5) * scale,
+        my: (e.ry + 0.5) * scale,
+      };
+    });
     drawEyeInk(ctx, eyes, !darumaSprite, darumaFaceColor);
     ctx.restore();
   }
@@ -2122,7 +2010,11 @@
         cleared = Math.max(0, Math.min(STAGES.length, Math.floor(n)));
         saveProgress();
       }
-      return { cleared, eyes: eyeStages(cleared), eyePixels: darumaEyes.map((e) => ({ x: e.x, y: e.y, rx: e.rx, ry: e.ry, r: e.r })), eyesDetected: !!darumaSprite };
+      return { cleared, eyes: eyeStages(cleared), eyePixels: DARUMA_EYES.map((e) => ({ x: e.x, y: e.y, rx: e.rx, ry: e.ry, r: e.r })), spriteReady: !!darumaSprite };
+    },
+    // 目なしスプライト（目の楕円を顔色で塗った複製）の canvas。画素が読めず作れていなければ null（確認用）
+    sprite() {
+      return darumaSprite;
     },
     // 物理を n ステップ同期で進める（自動テスト・ヘッドレス用）
     step(n = 1) {
