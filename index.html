@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>だるまおとし</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="stage-wrap">
+    <canvas id="game" width="960" height="540"></canvas>
+
+    <div id="hud">
+      <div id="stage-name"></div>
+      <div id="controls">
+        <span class="label">面</span>
+        <button class="stage-btn" data-stage="1">一</button>
+        <button class="stage-btn" data-stage="2">二</button>
+        <button class="stage-btn" data-stage="3">三</button>
+        <button id="btn-reset">やり直し</button>
+      </div>
+    </div>
+
+    <div id="result" hidden>
+      <div id="result-box">
+        <div id="result-text"></div>
+        <div id="result-buttons">
+          <button id="btn-retry">もう一度</button>
+          <button id="btn-next">次の面</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/matter-js@0.20.0/build/matter.min.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>

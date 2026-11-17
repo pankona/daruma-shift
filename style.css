@@ -1,0 +1,140 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #2b2622;
+  color: #2a2522;
+  font-family: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", serif;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* 論理画面 960x540。game.js が transform で拡大縮小して中央に置く */
+#stage-wrap {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 960px;
+  height: 540px;
+  transform-origin: 0 0;
+  background: #f3ead8;
+}
+
+#game {
+  display: block;
+  width: 960px;
+  height: 540px;
+  touch-action: none;
+}
+
+#hud {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  padding: 14px 18px;
+  pointer-events: none;
+}
+
+#stage-name {
+  font-size: 22px;
+  letter-spacing: 0.08em;
+}
+
+#controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  pointer-events: auto;
+}
+
+#controls .label {
+  font-size: 15px;
+  margin-right: 2px;
+}
+
+button {
+  font: inherit;
+  font-size: 16px;
+  color: #2a2522;
+  background: #fbf6ea;
+  border: 1.5px solid #2a2522;
+  border-radius: 4px;
+  padding: 4px 12px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+button:hover {
+  background: #efe3c8;
+}
+
+button:active {
+  background: #e4d4b0;
+}
+
+.stage-btn.current {
+  background: #2a2522;
+  color: #f3ead8;
+}
+
+#btn-reset {
+  margin-left: 10px;
+}
+
+#result {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(243, 234, 216, 0.55);
+}
+
+#result[hidden] {
+  display: none;
+}
+
+#result-box {
+  min-width: 320px;
+  padding: 26px 34px 22px;
+  text-align: center;
+  background: #fbf6ea;
+  border: 2px solid #2a2522;
+  border-radius: 6px;
+  box-shadow: 4px 4px 0 rgba(42, 37, 34, 0.25);
+}
+
+#result-text {
+  font-size: 34px;
+  letter-spacing: 0.15em;
+  margin-bottom: 18px;
+}
+
+#result-text.win {
+  color: #b3261e;
+}
+
+#result-buttons {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+#result-buttons button {
+  font-size: 18px;
+  padding: 6px 18px;
+}
+
+#result-buttons button[hidden] {
+  display: none;
+}
