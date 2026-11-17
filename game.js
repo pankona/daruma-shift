@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  const { Engine, Bodies, Body, Composite, Events, Vertices } = Matter;
+  const { Engine, Bodies, Body, Composite, Events, Vertices, Sleeping } = Matter;
 
   // ---- 定数 ----------------------------------------------------------
   const W = 960;
@@ -124,6 +124,7 @@
   // ---- 状態 ----------------------------------------------------------
   const engine = Engine.create();
   engine.gravity.y = 1;
+  engine.enableSleeping = true;
 
   let stageIndex = 0;
   let stage = null;
@@ -369,6 +370,8 @@
     if (!dir) return false;
     const p = Math.max(0, Math.min(1, power));
     if (p <= 0) return false;
+    // 眠っているボディは setVelocity だけでは動かない。全ボディを起こしてから叩く。
+    for (const body of dynamicBodies()) Sleeping.set(body, false);
     Body.setVelocity(b.body, { x: dir.x * p * MAX_SPEED, y: dir.y * p * MAX_SPEED });
     phase = 'moving';
     restFrames = 0;
