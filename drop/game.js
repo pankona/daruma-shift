@@ -2,6 +2,7 @@
 // 主観視点のターン制。段の塔の上に乗った敵だるまが飛来物を投げ、それが途中で止まる。
 // 時間停止の間に「飛来物の迎撃」と「段を殴る」を予約し、まとめて再生する。
 // 段には耐久があり、尽きた段は奥へ吹っ飛んで消え、上の段とだるまは一段分ストンと落ちる（離散。物理計算なし）。
+// 段を全部吹っ飛ばすとだるまが台に落ち、最終段階として本体を殴れるようになる。耐久が尽きたら破裂して勝ち。
 // 素の Canvas 2D と WebAudio だけで書く。論理画面は 960×540。
 (function () {
   'use strict';
@@ -11,22 +12,30 @@
   const H = 540;
   const TIMESTOP_MS = 4000; // 時間停止フェイズの長さ（実時間）
   const PUNCH_INTERVAL_MS = 60; // 再生フェイズで拳を繰り出す間隔
-  const SEGMENT_COUNT = 5; // 段の数
-  const SEG_HP = 6; // 段の耐久（この打数で吹っ飛ぶ）
+  // 段の種類。脆い段 = 明るい木、硬い段 = 暗い石に金属の帯。耐久の数字は画面に出さず、色で硬さを読ませる
+  const SEG_HP_FRAGILE = 3; // 脆い段の耐久（この打数で吹っ飛ぶ）
+  const SEG_HP_HARD = 10; // 硬い段の耐久
+  // 今回の面の構成（下から順）。硬い段は種類だけ用意し、今はまだ置かない
+  const LEVEL_KINDS = ['fragile', 'fragile', 'fragile', 'fragile', 'fragile'];
+  const SEGMENT_COUNT = LEVEL_KINDS.length; // 段の数
+  const DARUMA_HP = 16; // 最終段階で敵だるま本体が破裂するまでの打数
   const PLAYER_HP = 6; // 自だるまが砕けるまでの被弾数
   // 飛来物の数 = min(PROJ_MAX, PROJ_BASE + floor(ターン × PROJ_TURN_NUM / PROJ_TURN_DEN))（ora と同じ）
   const PROJ_BASE = 4;
-  const PROJ_MAX = 14;
+  const PROJ_MAX = 11;
   const PROJ_TURN_NUM = 2;
   const PROJ_TURN_DEN = 3;
 
   const SEG_W = 300; // 段の幅
-  const SEG_H = 36; // 段の高さ
+  const SEG_H = 58; // 段の高さ（落下・吹っ飛びの距離はすべてここから導く）
   const TABLE_Y = 470; // 台の上面
   const TABLE_W = 340; // 台の幅
   const CENTER_X = 480; // 塔の中心
-  const DARUMA_W = 150; // 敵だるまの絵の幅（透明部分を除いた絵の幅）
-  const SEG_COLORS = ['#d9482b', '#2e4a7a', '#d9a83a', '#4e7d4a', '#7a4a6e', '#b07040', '#5a8a8a'];
+  const DARUMA_W = 168; // 敵だるまの絵の幅（透明部分を除いた絵の幅）。積み上がった状態では上が少し見切れてよい
+  // 段の色。脆い段は明るい木の色を交互に（隣の段と見分けるため）、硬い段は暗い石の色
+  const FRAGILE_COLORS = ['#e3b566', '#d8a654'];
+  const HARD_COLOR = '#575b63';
+  const HARD_BAND = '#aaa49a'; // 硬い段の金属の帯
 
   const BLOW_MS = 300; // 段が奥へ吸い込まれて消えるまで
   const FALL_MS = 150; // 一段分（SEG_H）を落ち切るまでの目安
@@ -538,16 +547,19 @@
   })();
 
   // ---- ゲームの状態 ----
-  // finish = 最後の段が吹っ飛び、だるまが台へ落ちるのを待っている（着地で win）
+  // finish = 最後の段が吹っ飛び、だるまが台へ落ちるのを待っている（着地で最終段階へ）
   let phase = 'title'; // title | attack | timestop | replay | finish | impact | between | win | lose
   let turn = 0;
-  let segments = []; // 残っている段、下から順 { id, hp, hits, color, cracks, jolt, dispDy, holdUntil, vel, bounce }
+  let segments = []; // 残っている段、下から順 { id, kind, hp, maxHp, hits, color, cracks, jolt, dispDy, holdUntil, vel, bounce }
   let removed = 0; // 吹っ飛ばした段の数
+  let finale = false; // 最終段階（だるまが台の上にいて、本体を殴れる）
+  let darumaHits = 0; // 最終段階で本体に入れた打数
+  let darumaAlive = true;
   let playerHits = 0;
   let playerAlive = true;
   let projectiles = [];
-  let queue = []; // 予約した拳 { type: 'proj', id } | { type: 'seg', id }
-  let marks = []; // 時間停止中に付けた印 { x, y, label, kind }
+  let queue = []; // 予約した拳 { type: 'proj', id } | { type: 'seg', id } | { type: 'daruma', x, y }
+  let marks = []; // 時間停止中に付けた印 { x, y, label, kind }（label は飛来物の順番。段と本体の印は数字を出さない）
   let nextProjId = 1;
 
   let phaseTimer = 0; // フェイズ内の経過（ms、描画のクロックで進める）
@@ -669,11 +681,15 @@
     turn = 0;
     segments = [];
     for (let i = 0; i < SEGMENT_COUNT; i++) {
+      const kind = LEVEL_KINDS[i];
+      const maxHp = kind === 'hard' ? SEG_HP_HARD : SEG_HP_FRAGILE;
       segments.push({
         id: i + 1,
-        hp: SEG_HP,
+        kind,
+        hp: maxHp,
+        maxHp,
         hits: 0,
-        color: SEG_COLORS[i % SEG_COLORS.length],
+        color: kind === 'hard' ? HARD_COLOR : FRAGILE_COLORS[i % FRAGILE_COLORS.length],
         cracks: [],
         jolt: 0,
         dispDy: 0,
@@ -683,6 +699,9 @@
       });
     }
     removed = 0;
+    finale = false;
+    darumaHits = 0;
+    darumaAlive = true;
     playerHits = 0;
     playerAlive = true;
     projectiles = [];
@@ -766,9 +785,35 @@
       sound.shatter(pr.kind, p);
       return;
     }
+    if (q.type === 'daruma') {
+      if (!finale || !darumaAlive) return;
+      punchDaruma(q.x, q.y, p);
+      return;
+    }
     const idx = segments.findIndex((s) => s.id === q.id);
     if (idx < 0) return; // 同じ再生の中で先に吹っ飛んだ段。拳は出さず読み飛ばす
     punchSegment(idx, p);
+  }
+
+  // 最終段階：だるま本体を殴る。打点にヒビを足し（ora と同じ作り）、段階は耐久に対する割合で進む。尽きたら破裂して勝ち
+  function punchDaruma(x, y, p) {
+    const hand = punchCount % 2;
+    punchCount += 1;
+    lastPunch[hand] = { tx: x, ty: y, start: clock };
+    darumaHits = Math.min(DARUMA_HP, darumaHits + 1);
+    const dg = darumaGeom();
+    const rx = x - dg.cx;
+    const ry = y - dg.cy;
+    enemyView.cracks.push(generateCrack(enemyView, rx, ry, darumaHits));
+    enemyView.stage = stageOf(darumaHits, DARUMA_HP);
+    enemyView.dirty = true;
+    impacts.push({ x, y, age: 0, dur: 220, size: 34, color: WA.shu });
+    spawnSparks(x, y, 6);
+    daruma.squash = 0.12;
+    daruma.tilt += clamp(rx / (DARUMA_W / 2), -1, 1) * -0.06;
+    shake(90, 3 + 3 * p);
+    sound.punch(p);
+    if (darumaHits >= DARUMA_HP) killDaruma();
   }
 
   // 段 idx を殴る。耐久を 1 減らし、ヒビを足す。尽きたら吹っ飛ぶ
@@ -802,7 +847,7 @@
     const v = segVisual(idx);
     segments.splice(idx, 1);
     removed += 1;
-    blowing.push({ cx: CENTER_X, cy: v.cy, color: seg.color, cracks: seg.cracks, hits: seg.hits, id: seg.id, age: 0 });
+    blowing.push({ cx: CENTER_X, cy: v.cy, kind: seg.kind, color: seg.color, cracks: seg.cracks, hits: seg.hits, maxHp: seg.maxHp, id: seg.id, age: 0 });
     const hold = clock + BLOW_MS;
     for (let j = idx; j < segments.length; j++) {
       const s = segments[j];
@@ -822,11 +867,22 @@
     replayPause = Math.max(replayPause, BLOW_PAUSE_MS);
 
     if (!segments.length) {
-      // 最後の段。だるまが台へ落ちて着地したら勝ち
+      // 最後の段。だるまが台へ落ちて着地したら最終段階（本体を殴る）へ
       phase = 'finish';
       phaseTimer = 0;
       for (const p of projectiles) p.alive = false;
     }
+  }
+
+  // 最終段階に入る。だるまは台の上から飛来物を投げ続け、時間停止中は本体にも拳を予約できる
+  function enterFinale() {
+    if (finale) return;
+    finale = true;
+    darumaHits = 0;
+    daruma.dispDy = 0;
+    daruma.vel = 0;
+    banner = { text: '本体を殴れ', age: 0, color: WA.ai, dur: 1300 };
+    endTurn();
   }
 
   // 落下の一歩。留まり時間を過ぎたら加速して落ち、論理位置に着いたら止まる
@@ -859,7 +915,7 @@
       lastLandSound = clock;
       sound.land(big);
     }
-    if (big) startWin();
+    if (big) enterFinale();
   }
 
   function beginImpact() {
@@ -898,6 +954,31 @@
     projectiles = [];
   }
 
+  // だるま本体の耐久が尽きた。破片を散らして本体を消し、勝ちの演出へ
+  function killDaruma() {
+    darumaAlive = false;
+    const dg = darumaGeom();
+    for (let i = 0; i < 60; i++) {
+      const a = Math.random() * TAU;
+      const r = Math.sqrt(Math.random());
+      const sp = 5 + Math.random() * 12;
+      shards.push({
+        x: dg.cx + Math.cos(a) * r * (DARUMA_W / 2),
+        y: dg.cy + Math.sin(a) * r * (dg.artH / 2),
+        vx: Math.cos(a) * sp + (Math.random() - 0.5) * 4,
+        vy: Math.sin(a) * sp - 6 - Math.random() * 6,
+        rot: Math.random() * TAU,
+        vr: (Math.random() - 0.5) * 0.5,
+        age: 0,
+        dur: 1600 + Math.random() * 900,
+        color: ['#c8311c', '#c8311c', '#fffcf5', WA.kin, WA.sumi][Math.floor(Math.random() * 5)],
+        w: 8 + Math.random() * 20,
+        h: 6 + Math.random() * 14,
+      });
+    }
+    startWin();
+  }
+
   function startWin() {
     phase = 'win';
     phaseTimer = 0;
@@ -907,7 +988,7 @@
     impacts.push({ x: dg.cx, y: dg.cy, age: 0, dur: 500, size: 110, color: WA.kin });
     shake(260, 9);
     flash = { color: '255, 250, 230', alpha: 0.6 };
-    banner = { text: '落とした', age: 0, color: WA.shu };
+    banner = { text: '砕いた', age: 0, color: WA.shu };
     sound.burst();
     fireworksLeft = 5;
     fireworkTimer = 350;
@@ -944,7 +1025,8 @@
 
   // ---- 入力 ----
   // 時間停止中のクリック。飛来物 → 迎撃の予約、段 → その段を殴る予約（段のどこでも同じ）。
-  // だるま本体や何もない所は予約しない。実入力とテスト用フックの両方がここを通る
+  // だるま本体は最終段階（段が全部なくなって台に落ちた後）だけ予約できる。段が残っている間と何もない所は予約しない。
+  // 実入力とテスト用フックの両方がここを通る
   function handleClick(x, y) {
     if (phase !== 'timestop') return null;
     let best = null;
@@ -970,21 +1052,20 @@
       const r = segRect(i);
       if (x < r.x || x >= r.x + r.w || y < r.y || y >= r.y + r.h) continue;
       queue.push({ type: 'seg', id: segments[i].id });
-      marks.push({ x, y, label: String(queue.length), kind: 'seg' });
+      marks.push({ x, y, kind: 'seg' });
       sound.mark();
       return 'seg';
     }
-    return null;
-  }
-
-  // 段ごとの予約済みの打数（表示用）
-  function reservedCount() {
-    const n = new Map();
-    for (const q of queue) {
-      if (q.type !== 'seg') continue;
-      n.set(q.id, (n.get(q.id) || 0) + 1);
+    if (finale && darumaAlive && !segments.length) {
+      const dg = darumaGeom();
+      if (enemyView.inside(x - dg.cx, y - dg.cy)) {
+        queue.push({ type: 'daruma', x, y });
+        marks.push({ x, y, kind: 'daruma' });
+        sound.mark();
+        return 'daruma';
+      }
     }
-    return n;
+    return null;
   }
 
   // ---- 演出の部品 ----
@@ -1129,7 +1210,10 @@
       flash.alpha -= dt / 450;
       if (flash.alpha <= 0) flash = null;
     }
-    if (banner) banner.age += dt;
+    if (banner) {
+      banner.age += dt;
+      if (banner.dur && banner.age > banner.dur) banner = null; // 期限つきの見出し（最終段階の合図）は消す
+    }
     playerSquash *= Math.pow(0.001, dt / 260);
     // 勝利の花火と花びら
     if (phase === 'win') {
@@ -1196,7 +1280,7 @@
       if (replayPause <= 0 && replayIdx >= queue.length && phaseTimer >= replayDuration) beginImpact();
     } else if (phase === 'finish') {
       phaseTimer += dt;
-      if (phaseTimer > 2500) startWin(); // 保険。通常はだるまの着地（onLand）で勝ちになる
+      if (phaseTimer > 2500) enterFinale(); // 保険。通常はだるまの着地（onLand）で最終段階に入る
     } else if (phase === 'impact') {
       phaseTimer += dt;
       let pending = false;
@@ -1342,10 +1426,11 @@
     ctx.restore();
   }
 
-  // 段の本体。中心を原点に描く。seg は { color, cracks, hits } を持つ
+  // 段の本体。中心を原点に描く。seg は { kind, color, cracks, hits, maxHp } を持つ
   function drawSegmentBody(ctx, seg) {
     const w = SEG_W;
     const h = SEG_H;
+    const hard = seg.kind === 'hard';
     ctx.lineWidth = 3;
     ctx.strokeStyle = WA.sumi;
     ctx.fillStyle = seg.color;
@@ -1355,21 +1440,51 @@
     ctx.save();
     ctx.clip();
     ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
-    ctx.fillRect(-w / 2, -h / 2, w, 8);
+    ctx.fillRect(-w / 2, -h / 2, w, 9);
     ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
-    ctx.fillRect(-w / 2, h / 2 - 7, w, 7);
-    // 木目
-    ctx.strokeStyle = 'rgba(42, 37, 34, 0.22)';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(-w / 2 + 20, -2);
-    ctx.lineTo(w / 2 - 30, -3);
-    ctx.moveTo(-w / 2 + 40, 7);
-    ctx.lineTo(w / 2 - 16, 6);
-    ctx.stroke();
+    ctx.fillRect(-w / 2, h / 2 - 8, w, 8);
+    if (hard) {
+      // 石の肌：まばらな暗い斑
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.16)';
+      for (let i = 0; i < 9; i++) {
+        const sx = -w / 2 + 24 + ((i * 97) % (w - 48));
+        const sy = -h / 2 + 14 + ((i * 53) % (h - 28));
+        ctx.beginPath();
+        ctx.ellipse(sx, sy, 7 + (i % 3) * 2, 3 + (i % 2), (i * 0.7) % 1, 0, TAU);
+        ctx.fill();
+      }
+      // 金属の帯：上下に 2 本、鋲を打つ
+      for (const by of [-h / 2 + 15, h / 2 - 15]) {
+        ctx.fillStyle = HARD_BAND;
+        ctx.fillRect(-w / 2, by - 5, w, 10);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+        ctx.fillRect(-w / 2, by - 5, w, 3);
+        ctx.strokeStyle = 'rgba(42, 37, 34, 0.7)';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(-w / 2, by - 5, w, 10);
+        ctx.fillStyle = WA.sumi;
+        for (let rx = -w / 2 + 22; rx < w / 2 - 10; rx += 32) {
+          ctx.beginPath();
+          ctx.arc(rx, by, 2.2, 0, TAU);
+          ctx.fill();
+        }
+      }
+    } else {
+      // 木目：高さいっぱいに 3 本
+      ctx.strokeStyle = 'rgba(42, 37, 34, 0.22)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(-w / 2 + 20, -h * 0.26);
+      ctx.lineTo(w / 2 - 30, -h * 0.28);
+      ctx.moveTo(-w / 2 + 40, 1);
+      ctx.lineTo(w / 2 - 16, 0);
+      ctx.moveTo(-w / 2 + 28, h * 0.27);
+      ctx.lineTo(w / 2 - 44, h * 0.25);
+      ctx.stroke();
+    }
     // ヒビ。段階：0 = 薄い、1 = 中、2 = 大（打数の割合で決まる）
     if (seg.cracks.length) {
-      const stage = stageOf(Math.min(seg.hits, SEG_HP - 1), SEG_HP);
+      const stage = stageOf(Math.min(seg.hits, seg.maxHp - 1), seg.maxHp);
       const lenMul = [0.45, 0.8, 1.2][stage];
       const lw = [1.2, 2, 3][stage];
       const alpha = [0.5, 0.85, 1][stage];
@@ -1429,7 +1544,8 @@
       drawSegmentBody(ctx, segments[i]);
       ctx.restore();
     }
-    // 敵だるま。足元を支点に傾き・前のめり・着地の縮み
+    // 敵だるま。足元を支点に傾き・前のめり・着地の縮み。破裂したら描かない
+    if (!darumaAlive) return;
     const dg = darumaGeom();
     const bottom = dg.bottom + daruma.dispDy;
     ctx.save();
@@ -1638,60 +1754,24 @@
         ctx.fillStyle = WA.kin;
         ctx.fillText(m.label, m.x + r + 10, m.y - r * 0.5);
       } else {
+        // 段・本体への予約：クリックした位置に小さな衝撃の星だけ。数字は出さない
+        ctx.save();
+        ctx.translate(m.x, m.y);
         ctx.fillStyle = WA.shu;
         ctx.strokeStyle = WA.shiro;
+        ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.arc(m.x, m.y, 7, 0, TAU);
+        for (let i = 0; i < 16; i++) {
+          const a = (i * TAU) / 16 - Math.PI / 2;
+          const rr = i % 2 ? 4.5 : 10;
+          if (i) ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+          else ctx.moveTo(Math.cos(a) * rr, Math.sin(a) * rr);
+        }
+        ctx.closePath();
         ctx.fill();
         ctx.stroke();
-        ctx.fillStyle = WA.shiro;
-        ctx.textAlign = 'left';
-        ctx.fillText(m.label, m.x + 11, m.y - 12);
-        ctx.textAlign = 'center';
+        ctx.restore();
       }
-    }
-    ctx.restore();
-  }
-
-  // 時間停止中の塔の読み取り補助：段ごとの「あと何打で吹っ飛ぶか」。
-  // 左に SEG_HP 個の丸（金 = 予約を引いても残る耐久、朱 = 予約済みの打数、灰 = すでに失った耐久）、右に「あと N」
-  function drawTowerGuide(ctx) {
-    const reserved = reservedCount();
-    ctx.save();
-    ctx.textBaseline = 'middle';
-    for (let i = 0; i < segments.length; i++) {
-      const s = segments[i];
-      const r = segRect(i);
-      const cy = r.y + r.h / 2;
-      const res = reserved.get(s.id) || 0;
-      const remain = s.hp - res;
-      // 丸の列
-      const x0 = r.x + 16;
-      for (let d = 0; d < SEG_HP; d++) {
-        const x = x0 + d * 12;
-        ctx.beginPath();
-        ctx.arc(x, cy, 4, 0, TAU);
-        if (d < remain) {
-          ctx.fillStyle = WA.kin;
-          ctx.fill();
-        } else if (d < s.hp) {
-          ctx.fillStyle = WA.shu;
-          ctx.fill();
-        } else {
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
-          ctx.lineWidth = 1.2;
-          ctx.stroke();
-        }
-      }
-      // 残り数
-      const text = remain > 0 ? `あと ${remain}` : '吹っ飛ぶ';
-      ctx.font = `bold 20px ${MINCHO}`;
-      ctx.textAlign = 'right';
-      ctx.lineWidth = 5;
-      ctx.strokeStyle = 'rgba(0, 0, 0, 0.7)';
-      ctx.strokeText(text, r.x + r.w - 14, cy);
-      ctx.fillStyle = remain > 0 ? WA.shiro : WA.shu;
-      ctx.fillText(text, r.x + r.w - 14, cy);
     }
     ctx.restore();
   }
@@ -1745,11 +1825,13 @@
     if (!banner) return;
     const t = clamp(banner.age / 320, 0, 1);
     const pop = 0.7 + 0.3 * easeOut(t) + (t < 1 ? 0.15 * Math.sin(t * Math.PI) : 0);
+    // 期限つきの見出しは終わりの 300ms で消えていく
+    const fade = banner.dur ? clamp((banner.dur - banner.age) / 300, 0, 1) : 1;
     ctx.save();
     ctx.translate(W / 2, H / 2 - 20);
     ctx.rotate(-0.06);
     ctx.scale(pop, pop);
-    ctx.globalAlpha = t;
+    ctx.globalAlpha = t * fade;
     ctx.font = `bold 120px ${MINCHO}`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
@@ -1844,7 +1926,6 @@
       ctx.fillStyle = 'rgba(30, 40, 90, 0.18)';
       ctx.fillRect(0, 0, W, H);
       ctx.restore();
-      drawTowerGuide(ctx);
       drawMarks(ctx);
       drawCountdown(ctx, now);
     }
@@ -1878,8 +1959,8 @@
         resultText.textContent = win ? '勝ち' : '負け';
         resultText.className = win ? 'win' : '';
         resultSub.textContent = win
-          ? `${turn} 回で全部吹っ飛ばした。被弾 ${playerHits}`
-          : `${turn} 回目に砕けた。吹っ飛ばした段 ${removed}`;
+          ? `${turn} 回で砕いた。被弾 ${playerHits}`
+          : `${turn} 回目に砕けた。吹っ飛ばした段 ${removed}${finale ? `、本体に ${darumaHits} 打` : ''}`;
       }
     },
     showGo(on) {
@@ -1932,10 +2013,12 @@
         playerHits,
         segments: segments.map((s, i) => {
           const r = segRect(i);
-          return { x: r.x, y: r.y, w: r.w, h: r.h, hp: s.hp, maxHp: SEG_HP };
+          return { x: r.x, y: r.y, w: r.w, h: r.h, kind: s.kind, hp: s.hp, maxHp: s.maxHp };
         }),
         darumaRect: darumaRect(),
         removed,
+        finale,
+        darumaHp: finale ? DARUMA_HP - darumaHits : null,
         projectiles: projectiles
           .filter((p) => p.alive)
           .map((p) => {
