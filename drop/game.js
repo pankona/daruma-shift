@@ -2,8 +2,9 @@
 // 主観視点のターン制。段の塔の上に乗った敵だるまが飛来物を投げ、それが途中で止まる。
 // 時間停止の間に「飛来物の迎撃」と「段を殴る」を予約し、まとめて再生する。
 // 段には耐久があり、尽きた段は奥へ吹っ飛んで消え、上の段とだるまは一段分ストンと落ちる（離散。物理計算なし）。
-// 塔は画面の上端を超えて高く、敵だるまは最初は画面の外にいる。段を壊すたびに一段分ずつ降りてきて、姿が見えてくる。
-// 段を全部吹っ飛ばすとだるまが台に落ち、最終段階として本体を殴れるようになる。耐久が尽きたら破裂して勝ち。
+// 段は一画面に収まるのが実質 1 個という大きさ（620×500）。塔は画面の上端をはるかに超え、敵だるまは最後の段が抜けるまで
+// 完全に画面の外にいる。段を吹っ飛ばすたびに次の巨大な段が上から落ちてくる。
+// 最後の段を吹っ飛ばすとだるまが画面の上から落ちてきて台に着地し、最終段階として本体を殴れるようになる。耐久が尽きたら破裂して勝ち。
 // 素の Canvas 2D と WebAudio だけで書く。論理画面は 960×540。
 (function () {
   'use strict';
@@ -14,11 +15,11 @@
   const TIMESTOP_MS = 4000; // 時間停止フェイズの長さ（実時間）
   const PUNCH_INTERVAL_MS = 60; // 再生フェイズで拳を繰り出す間隔
   // 段の種類。脆い段 = 明るい木、硬い段 = 暗い石に金属の帯。耐久の数字は画面に出さず、色で硬さを読ませる
-  const SEG_HP_FRAGILE = 3; // 脆い段の耐久（この打数で吹っ飛ぶ）
+  const SEG_HP_FRAGILE = 5; // 脆い段の耐久（この打数で吹っ飛ぶ）
   const SEG_HP_HARD = 10; // 硬い段の耐久
   // 今回の面の構成（下から順）。硬い段は種類だけ用意し、今はまだ置かない
-  const LEVEL_KINDS = ['fragile', 'fragile', 'fragile', 'fragile', 'fragile', 'fragile', 'fragile'];
-  const SEGMENT_COUNT = LEVEL_KINDS.length; // 段の数（7）
+  const LEVEL_KINDS = ['fragile', 'fragile', 'fragile', 'fragile'];
+  const SEGMENT_COUNT = LEVEL_KINDS.length; // 段の数（4）
   const DARUMA_HP = 12; // 最終段階で敵だるま本体が破裂するまでの打数
   const PLAYER_HP = 6; // 自だるまが砕けるまでの被弾数
   // 飛来物の数 = min(PROJ_MAX, PROJ_BASE + floor(ターン × PROJ_TURN_NUM / PROJ_TURN_DEN))（ora と同じ）
@@ -27,14 +28,15 @@
   const PROJ_TURN_NUM = 2;
   const PROJ_TURN_DEN = 3;
 
-  const SEG_W = 300; // 段の幅
-  const SEG_H = 80; // 段の高さ（落下・吹っ飛びの距離はすべてここから導く）
+  const SEG_W = 620; // 段の幅（画面中央）
+  const SEG_H = 500; // 段の高さ（落下・吹っ飛びの距離はすべてここから導く）。一番下の段は台の上面から y = -30 まで届き、見える段は実質 1 個
   const TABLE_Y = 470; // 台の上面
-  const TABLE_W = 340; // 台の幅
+  const TABLE_W = 680; // 台の幅（段の幅 620 に釣り合わせる）
   const CENTER_X = 480; // 塔の中心
-  // 敵だるまの絵の幅（透明部分を除いた絵の幅）。塔の高さ SEG_H × SEGMENT_COUNT = 560 は台の上面 470 より高いので、
-  // 全段そろった状態ではだるまは画面の上端より外（足元 y = -90）にいて見えない。段が減るたび 80 ずつ降りてくる
+  // 敵だるまの絵の幅（透明部分を除いた絵の幅）。塔の高さ SEG_H × SEGMENT_COUNT = 2000 なので、だるまは最後の段が抜けるまで
+  // 完全に画面の外。最後の段が吹っ飛ぶと、画面の上端の外（足元 y = -30）から台まで 500 落ちてきて着地する
   const DARUMA_W = 168;
+  const SEG_CRACK_SCALE = SEG_H / 110; // 段のヒビの大きさ（小さい段向けの形をこの倍率で広げる。全面に読める太さと長さにする）
   // 飛来物の投げ元の y の下限。だるまが画面の外にいる間も、時間停止時の飛来物が画面の中で止まるように押し込む
   const THROW_Y_MIN = 70;
   // 届かない拳（段が残っているうちにだるまを叩こうとしたときの空振り）
@@ -46,12 +48,12 @@
   const HARD_COLOR = '#575b63';
   const HARD_BAND = '#aaa49a'; // 硬い段の金属の帯
 
-  const BLOW_MS = 300; // 段が奥へ吸い込まれて消えるまで
-  const FALL_MS = 150; // 一段分（SEG_H）を落ち切るまでの目安
+  const BLOW_MS = 480; // 段が奥へ吸い込まれて消えるまで（巨大な段なので少し長く）
+  const FALL_MS = 500; // 一段分（SEG_H）を落ち切るまでの目安。約 500ms かけて加速して落ちる
   const FALL_G = (2 * SEG_H) / (FALL_MS * FALL_MS); // 落下の加速（px/ms²）。静止から FALL_MS で SEG_H 落ちる
-  const BOUNCE_MS = 150; // 着地の小さな跳ね
-  const BLOW_PAUSE_MS = 560; // 吹っ飛びのあと、拳の再生を止めて見せ場を読ませる時間
-  const VANISH_Y = 110; // 吹っ飛ぶ段が吸い込まれる一点の高さ（x は塔の中心）
+  const BOUNCE_MS = 220; // 着地の縮み（重い段なので跳ねずに潰れる）
+  const BLOW_PAUSE_MS = 1100; // 吹っ飛びのあと、拳の再生を止めて見せ場を読ませる時間（吹っ飛び BLOW_MS ＋ 落下 FALL_MS ＋ 着地）
+  const VANISH_Y = 140; // 吹っ飛ぶ段が吸い込まれる一点の高さ（x は塔の中心）
 
   const ATTACK_MS = 750; // 飛来物が塔から出て止まるまでの時間
   const FREEZE_Z = 0.6; // 時間停止時の奥行き（0 = 投げ手の位置、1 = プレイヤーの顔）
@@ -320,17 +322,18 @@
     return { x: rx, y: ry, n, branches, chip };
   }
 
-  // 段のヒビ。段の番号と何打目かから決定的に作る（段の中心を原点にした座標）。横長の板なので横に走りやすくする
+  // 段のヒビ。段の番号と何打目かから決定的に作る（段の中心を原点にした座標）。
+  // 巨大な段（620×500）の全面に散らし、枝の長さは SEG_CRACK_SCALE で広げる（100〜250px ほど）。少し横に走りやすくする
   function generateSegCrack(segId, n) {
     const rng = mulberry32(hash3(segId, n, 101));
-    const x = (rng() - 0.5) * (SEG_W - 70);
-    const y = (rng() - 0.5) * (SEG_H - 12);
+    const x = (rng() - 0.5) * (SEG_W - 180);
+    const y = (rng() - 0.5) * (SEG_H - 160);
     const branches = [];
     const nb = 2 + Math.floor(rng() * 3);
     const a0 = rng() * TAU;
     for (let b = 0; b < nb; b++) {
       let a = a0 + (b * TAU) / nb + (rng() - 0.5) * 0.8;
-      const total = 22 + rng() * 34;
+      const total = (22 + rng() * 34) * SEG_CRACK_SCALE;
       const segs = 3 + Math.floor(rng() * 3);
       let cx = 0;
       let cy = 0;
@@ -339,7 +342,7 @@
         a += (rng() - 0.5) * 1.1;
         const step = (total / segs) * (0.7 + 0.6 * rng());
         cx += Math.cos(a) * step;
-        cy += Math.sin(a) * step * 0.55;
+        cy += Math.sin(a) * step * 0.8;
         pts.push({ x: cx, y: cy });
       }
       branches.push(pts);
@@ -456,27 +459,28 @@
         wood(2 + Math.floor(p * 6), 0.95, t);
         tone(110, 55, t, 0.08, 0.3, 'sine');
       },
-      // 段が吹っ飛ぶ：大きめの破裂音と風切り
+      // 段が吹っ飛ぶ：大きめの破裂音と長い風切り（巨大な段が奥へ飛んでいく）
       blow() {
         if (!live()) return;
         const t = ac.currentTime;
-        tone(85, 28, t, 0.45, 0.95, 'sine');
-        hiss(t, 0.12, 0.65, 'lowpass', 520, 0.7);
-        hiss(t, 0.05, 0.45, 'bandpass', 1600, 1.2);
+        tone(80, 26, t, 0.55, 0.95, 'sine');
+        hiss(t, 0.16, 0.7, 'lowpass', 480, 0.7);
+        hiss(t, 0.06, 0.45, 'bandpass', 1500, 1.2);
         wood(1, 0.8, t + 0.01);
-        sweep(t + 0.03, 0.32, 0.4, 500, 3400);
+        sweep(t + 0.04, 0.45, 0.42, 450, 3000);
       },
-      // 落下の着地：低い音
+      // 落下の着地：低い音。段の着地も巨大な塊が落ちる重さで鳴らし、だるまの着地（big）はさらに太く
       land(big) {
         if (!live()) return;
         const t = ac.currentTime;
         if (big) {
-          tone(90, 34, t, 0.36, 0.85, 'sine');
-          hiss(t, 0.12, 0.45, 'lowpass', 300, 0.8);
-          wood(0, 0.7, t + 0.03);
+          tone(80, 30, t, 0.5, 0.95, 'sine');
+          hiss(t, 0.16, 0.5, 'lowpass', 280, 0.8);
+          wood(0, 0.8, t + 0.03);
         } else {
-          tone(100, 42, t, 0.2, 0.55, 'sine');
-          hiss(t, 0.07, 0.32, 'lowpass', 350, 0.8);
+          tone(88, 34, t, 0.38, 0.85, 'sine');
+          hiss(t, 0.12, 0.45, 'lowpass', 320, 0.8);
+          wood(0, 0.5, t + 0.02);
         }
       },
       // 飛来物の破砕：木はカラッと、岩はザクッと
@@ -635,8 +639,8 @@
     const s = segments[i];
     const r = segRect(i);
     return {
-      cx: r.x + r.w / 2 + Math.sin(clock / 17 + i * 1.7) * 5 * s.jolt,
-      cy: r.y + r.h / 2 + s.dispDy - 6 * Math.sin(Math.PI * s.bounce),
+      cx: r.x + r.w / 2 + Math.sin(clock / 17 + i * 1.7) * 6 * s.jolt,
+      cy: r.y + r.h / 2 + s.dispDy,
     };
   }
   function stageOf(hits, hp) {
@@ -842,8 +846,8 @@
     const hand = punchCount % 2;
     punchCount += 1;
     const r = segRect(idx);
-    // 拳の着弾点：手の側に寄せた段の面
-    const tx = r.x + r.w / 2 + (hand === 0 ? -50 : 50);
+    // 拳の着弾点：手の側に寄せた段の面（巨大な段なので中心から幅の 1/4 ほど外へ）
+    const tx = r.x + r.w / 2 + (hand === 0 ? -1 : 1) * SEG_W * 0.24;
     const ty = r.y + r.h / 2 + seg.dispDy;
     lastPunch[hand] = { tx, ty, start: clock };
 
@@ -853,15 +857,15 @@
     seg.jolt = 1;
     daruma.tilt += (hand === 0 ? 1 : -1) * 0.05;
 
-    impacts.push({ x: tx, y: ty, age: 0, dur: 220, size: 30, color: WA.shu });
-    spawnSparks(tx, ty, 6);
+    impacts.push({ x: tx, y: ty, age: 0, dur: 220, size: 34, color: WA.shu });
+    spawnSparks(tx, ty, 8);
     shake(90, 3 + 3 * p);
     sound.knock(p);
 
     if (seg.hp <= 0) blowSegment(idx);
   }
 
-  // 段 idx が奥へ吹っ飛ぶ。上の段とだるまは一段分落ちる（BLOW_MS の間だけ宙に留まってから落ちる）
+  // 段 idx が奥へ吹っ飛ぶ。上の段とだるまは一段分（SEG_H = 500）落ちる（BLOW_MS の間だけ宙に留まってから、約 FALL_MS かけて加速して落ちる）
   function blowSegment(idx) {
     const seg = segments[idx];
     const v = segVisual(idx);
@@ -879,15 +883,15 @@
     daruma.holdUntil = hold;
     daruma.vel = 0;
 
-    impacts.push({ x: CENTER_X, y: v.cy, age: 0, dur: 340, size: 60, color: WA.kin });
-    spawnSparks(CENTER_X, v.cy, 12);
-    spawnShards(CENTER_X, v.cy, [seg.color, '#8a5a2b', WA.shiro], 10, 70);
-    shake(180, 7);
+    impacts.push({ x: CENTER_X, y: v.cy, age: 0, dur: 420, size: 130, color: WA.kin });
+    spawnSparks(CENTER_X, v.cy, 20);
+    spawnShards(CENTER_X, v.cy, [seg.color, '#8a5a2b', WA.shiro], 18, 150);
+    shake(260, 12);
     sound.blow();
     replayPause = Math.max(replayPause, BLOW_PAUSE_MS);
 
     if (!segments.length) {
-      // 最後の段。だるまが台へ落ちて着地したら最終段階（本体を殴る）へ
+      // 最後の段。だるまは画面の上端の外（足元 y = -30）から台へ 500 落ちてくる。着地したら最終段階（本体を殴る）へ
       phase = 'finish';
       phaseTimer = 0;
       for (const p of projectiles) p.alive = false;
@@ -918,17 +922,23 @@
     }
   }
 
+  // 着地。巨大な段が 500 落ちてくる重さに釣り合うよう、揺れと土煙は大きく。だるまの着地（big）はさらに大きく
   function onLand(o, isDaruma) {
     const big = isDaruma && phase === 'finish';
     if (isDaruma) {
-      daruma.squash = big ? 0.3 : 0.16;
+      daruma.squash = big ? 0.32 : 0.16;
       const dg = darumaGeom();
-      spawnPuffs(dg.cx, dg.bottom, big ? 14 : 6, DARUMA_W * 0.5);
+      spawnPuffs(dg.cx, dg.bottom, big ? 26 : 6, DARUMA_W * 0.6, big ? 2.4 : 1);
+      if (big) {
+        impacts.push({ x: dg.cx, y: dg.bottom, age: 0, dur: 360, size: 90, color: WA.kin });
+        shake(380, 18);
+      }
     } else {
       o.bounce = 1;
       const i = segments.indexOf(o);
       const r = segRect(i);
-      spawnPuffs(CENTER_X, r.y + r.h, 6, SEG_W * 0.5);
+      spawnPuffs(CENTER_X, r.y + r.h, 22, SEG_W * 0.5, 2.2);
+      shake(300, 14);
     }
     // 同時に着地する段の音は 1 回にまとめる
     if (clock - lastLandSound > 40 || big) {
@@ -1151,19 +1161,21 @@
       });
     }
   }
-  // 土煙：足元の線 (x ± spread, y) から左右へ広がる
-  function spawnPuffs(x, y, n, spread) {
+  // 土煙：足元の線 (x ± spread, y) から左右へ広がる。size で粒の大きさ・速さ・持ち時間をまとめて大きくする
+  function spawnPuffs(x, y, n, spread, size) {
+    const k = size || 1;
     for (let i = 0; i < n; i++) {
       const side = i % 2 ? 1 : -1;
       const ox = (0.5 + Math.random() * 0.5) * spread * side;
       puffs.push({
         x: x + ox,
-        y: y - 2 - Math.random() * 4,
-        vx: side * (1.2 + Math.random() * 2.2),
-        vy: -(0.4 + Math.random() * 0.9),
-        r: 5 + Math.random() * 6,
+        y: y - 2 - Math.random() * 4 * k,
+        vx: side * (1.2 + Math.random() * 2.2) * k,
+        vy: -(0.4 + Math.random() * 0.9) * k,
+        r: (5 + Math.random() * 6) * k,
+        grow: 0.5 * k,
         age: 0,
-        dur: 380 + Math.random() * 220,
+        dur: (380 + Math.random() * 220) * (0.6 + 0.4 * k),
       });
     }
   }
@@ -1190,7 +1202,7 @@
       p.x += p.vx * f;
       p.y += p.vy * f;
       p.vx *= Math.pow(0.1, dt / 400);
-      p.r += 0.5 * f;
+      p.r += p.grow * f;
       if (p.age > p.dur) puffs.splice(i, 1);
     }
   }
@@ -1319,8 +1331,9 @@
       }
       if (replayPause <= 0 && replayIdx >= queue.length && phaseTimer >= replayDuration) beginImpact();
     } else if (phase === 'finish') {
+      // だるまが画面の外から台へ落ちてくる（宙に留まる BLOW_MS ＋ 落下 FALL_MS ≒ 1 秒）。通常は着地（onLand）で最終段階に入る
       phaseTimer += dt;
-      if (phaseTimer > 2500) enterFinale(); // 保険。通常はだるまの着地（onLand）で最終段階に入る
+      if (phaseTimer > BLOW_MS + FALL_MS + 1500) enterFinale(); // 保険
     } else if (phase === 'impact') {
       phaseTimer += dt;
       let pending = false;
@@ -1484,63 +1497,65 @@
     const w = SEG_W;
     const h = SEG_H;
     const hard = seg.kind === 'hard';
-    ctx.lineWidth = 3;
+    const corner = 16;
+    ctx.lineWidth = 5;
     ctx.strokeStyle = WA.sumi;
     ctx.fillStyle = seg.color;
-    roundRect(ctx, -w / 2, -h / 2, w, h, 7);
+    roundRect(ctx, -w / 2, -h / 2, w, h, corner);
     ctx.fill();
     // 上面の光と下の影
     ctx.save();
     ctx.clip();
     ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
-    ctx.fillRect(-w / 2, -h / 2, w, 9);
+    ctx.fillRect(-w / 2, -h / 2, w, 22);
     ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
-    ctx.fillRect(-w / 2, h / 2 - 8, w, 8);
+    ctx.fillRect(-w / 2, h / 2 - 20, w, 20);
     if (hard) {
       // 石の肌：まばらな暗い斑
       ctx.fillStyle = 'rgba(0, 0, 0, 0.16)';
-      for (let i = 0; i < 9; i++) {
-        const sx = -w / 2 + 24 + ((i * 97) % (w - 48));
-        const sy = -h / 2 + 14 + ((i * 53) % (h - 28));
+      for (let i = 0; i < 24; i++) {
+        const sx = -w / 2 + 40 + ((i * 197) % (w - 80));
+        const sy = -h / 2 + 50 + ((i * 131) % (h - 100));
         ctx.beginPath();
-        ctx.ellipse(sx, sy, 7 + (i % 3) * 2, 3 + (i % 2), (i * 0.7) % 1, 0, TAU);
+        ctx.ellipse(sx, sy, 18 + (i % 3) * 6, 8 + (i % 2) * 4, (i * 0.7) % 1, 0, TAU);
         ctx.fill();
       }
       // 金属の帯：上下に 2 本、鋲を打つ
-      for (const by of [-h / 2 + 15, h / 2 - 15]) {
+      for (const by of [-h / 2 + 44, h / 2 - 44]) {
         ctx.fillStyle = HARD_BAND;
-        ctx.fillRect(-w / 2, by - 5, w, 10);
+        ctx.fillRect(-w / 2, by - 13, w, 26);
         ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
-        ctx.fillRect(-w / 2, by - 5, w, 3);
+        ctx.fillRect(-w / 2, by - 13, w, 7);
         ctx.strokeStyle = 'rgba(42, 37, 34, 0.7)';
-        ctx.lineWidth = 1.5;
-        ctx.strokeRect(-w / 2, by - 5, w, 10);
+        ctx.lineWidth = 2.5;
+        ctx.strokeRect(-w / 2, by - 13, w, 26);
         ctx.fillStyle = WA.sumi;
-        for (let rx = -w / 2 + 22; rx < w / 2 - 10; rx += 32) {
+        for (let rx = -w / 2 + 40; rx < w / 2 - 20; rx += 64) {
           ctx.beginPath();
-          ctx.arc(rx, by, 2.2, 0, TAU);
+          ctx.arc(rx, by, 5.5, 0, TAU);
           ctx.fill();
         }
       }
     } else {
       // 木目：高さいっぱいに 3 本
       ctx.strokeStyle = 'rgba(42, 37, 34, 0.22)';
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = 3.5;
       ctx.beginPath();
-      ctx.moveTo(-w / 2 + 20, -h * 0.26);
-      ctx.lineTo(w / 2 - 30, -h * 0.28);
-      ctx.moveTo(-w / 2 + 40, 1);
-      ctx.lineTo(w / 2 - 16, 0);
-      ctx.moveTo(-w / 2 + 28, h * 0.27);
-      ctx.lineTo(w / 2 - 44, h * 0.25);
+      ctx.moveTo(-w / 2 + 40, -h * 0.26);
+      ctx.lineTo(w / 2 - 60, -h * 0.28);
+      ctx.moveTo(-w / 2 + 80, 2);
+      ctx.lineTo(w / 2 - 32, 0);
+      ctx.moveTo(-w / 2 + 56, h * 0.27);
+      ctx.lineTo(w / 2 - 90, h * 0.25);
       ctx.stroke();
     }
-    // ヒビ。段階：0 = 薄い、1 = 中、2 = 大（打数の割合で決まる）
+    // ヒビ。段階：0 = 薄い、1 = 中、2 = 大（打数の割合で決まる）。巨大な段の全面で読めるよう太く長く描く
     if (seg.cracks.length) {
       const stage = stageOf(Math.min(seg.hits, seg.maxHp - 1), seg.maxHp);
       const lenMul = [0.45, 0.8, 1.2][stage];
-      const lw = [1.2, 2, 3][stage];
-      const alpha = [0.5, 0.85, 1][stage];
+      const lw = [3.5, 5.5, 8][stage];
+      const alpha = [0.55, 0.9, 1][stage];
+      const off = lw * 0.3; // 明るい線の添え方（割れ目の片側）
       if (stage >= 1) {
         ctx.fillStyle = `rgba(0, 0, 0, ${0.07 * stage})`;
         ctx.fillRect(-w / 2, -h / 2, w, h);
@@ -1556,8 +1571,8 @@
           ctx.lineWidth = lw;
           ctx.stroke();
           ctx.beginPath();
-          ctx.moveTo(cr.x - 0.8, cr.y - 0.8);
-          for (const p of br) ctx.lineTo(cr.x + p.x * lenMul - 0.8, cr.y + p.y * lenMul - 0.8);
+          ctx.moveTo(cr.x - off, cr.y - off);
+          for (const p of br) ctx.lineTo(cr.x + p.x * lenMul - off, cr.y + p.y * lenMul - off);
           ctx.strokeStyle = `rgba(255, 244, 226, ${0.45 * alpha})`;
           ctx.lineWidth = lw * 0.4;
           ctx.stroke();
@@ -1565,23 +1580,24 @@
       }
     }
     ctx.restore();
-    ctx.lineWidth = 3;
+    ctx.lineWidth = 5;
     ctx.strokeStyle = WA.sumi;
-    roundRect(ctx, -w / 2, -h / 2, w, h, 7);
+    roundRect(ctx, -w / 2, -h / 2, w, h, corner);
     ctx.stroke();
   }
 
-  // 奥へ吹っ飛ぶ段：一点（CENTER_X, VANISH_Y）へ縮みながら上がって消える。塔より奥に描く
+  // 奥へ吹っ飛ぶ段：一点（CENTER_X, VANISH_Y）へ縮みながら上がって消える。塔より奥に描く。
+  // 巨大な段なので、出だしは勢いよく縮み、終わりは小さな点になって消える（二段の ease で奥行きを強める）
   function drawBlowing(ctx) {
     for (const b of blowing) {
       const t = clamp(b.age / BLOW_MS, 0, 1);
       const e = easeOut(t);
-      const sc = lerp(1, 0.08, e);
+      const sc = lerp(1, 0.05, easeOut(e));
       const y = lerp(b.cy, VANISH_Y, e);
       ctx.save();
       ctx.globalAlpha = 1 - t * t;
       ctx.translate(b.cx, y);
-      ctx.rotate((b.id % 2 ? 1 : -1) * 0.35 * t);
+      ctx.rotate((b.id % 2 ? 1 : -1) * 0.45 * t);
       ctx.scale(sc, sc);
       drawSegmentBody(ctx, b);
       ctx.restore();
@@ -1593,8 +1609,12 @@
     for (let i = 0; i < segments.length; i++) {
       const v = segVisual(i);
       if (v.cy + SEG_H / 2 + 8 < 0) continue; // 画面の上端より外にある段は描かない（並びは segments のまま保つ）
+      // 着地の縮み：下端を支点に横へ少し潰れる（重い塊が落ちた手触り。跳ねはしない）
+      const sq = 0.05 * Math.sin(Math.PI * segments[i].bounce);
       ctx.save();
-      ctx.translate(v.cx, v.cy);
+      ctx.translate(v.cx, v.cy + SEG_H / 2);
+      ctx.scale(1 + sq, 1 - sq);
+      ctx.translate(0, -SEG_H / 2);
       drawSegmentBody(ctx, segments[i]);
       ctx.restore();
     }
