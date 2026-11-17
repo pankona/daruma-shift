@@ -2,6 +2,7 @@
 // 主観視点のターン制。段の塔の上に乗った敵だるまが飛来物を投げ、それが途中で止まる。
 // 時間停止の間に「飛来物の迎撃」と「段を殴る」を予約し、まとめて再生する。
 // 段には耐久があり、尽きた段は奥へ吹っ飛んで消え、上の段とだるまは一段分ストンと落ちる（離散。物理計算なし）。
+// 塔は画面の上端を超えて高く、敵だるまは最初は画面の外にいる。段を壊すたびに一段分ずつ降りてきて、姿が見えてくる。
 // 段を全部吹っ飛ばすとだるまが台に落ち、最終段階として本体を殴れるようになる。耐久が尽きたら破裂して勝ち。
 // 素の Canvas 2D と WebAudio だけで書く。論理画面は 960×540。
 (function () {
@@ -16,22 +17,30 @@
   const SEG_HP_FRAGILE = 3; // 脆い段の耐久（この打数で吹っ飛ぶ）
   const SEG_HP_HARD = 10; // 硬い段の耐久
   // 今回の面の構成（下から順）。硬い段は種類だけ用意し、今はまだ置かない
-  const LEVEL_KINDS = ['fragile', 'fragile', 'fragile', 'fragile', 'fragile'];
-  const SEGMENT_COUNT = LEVEL_KINDS.length; // 段の数
-  const DARUMA_HP = 16; // 最終段階で敵だるま本体が破裂するまでの打数
+  const LEVEL_KINDS = ['fragile', 'fragile', 'fragile', 'fragile', 'fragile', 'fragile', 'fragile'];
+  const SEGMENT_COUNT = LEVEL_KINDS.length; // 段の数（7）
+  const DARUMA_HP = 12; // 最終段階で敵だるま本体が破裂するまでの打数
   const PLAYER_HP = 6; // 自だるまが砕けるまでの被弾数
   // 飛来物の数 = min(PROJ_MAX, PROJ_BASE + floor(ターン × PROJ_TURN_NUM / PROJ_TURN_DEN))（ora と同じ）
   const PROJ_BASE = 4;
-  const PROJ_MAX = 11;
+  const PROJ_MAX = 10;
   const PROJ_TURN_NUM = 2;
   const PROJ_TURN_DEN = 3;
 
   const SEG_W = 300; // 段の幅
-  const SEG_H = 58; // 段の高さ（落下・吹っ飛びの距離はすべてここから導く）
+  const SEG_H = 80; // 段の高さ（落下・吹っ飛びの距離はすべてここから導く）
   const TABLE_Y = 470; // 台の上面
   const TABLE_W = 340; // 台の幅
   const CENTER_X = 480; // 塔の中心
-  const DARUMA_W = 168; // 敵だるまの絵の幅（透明部分を除いた絵の幅）。積み上がった状態では上が少し見切れてよい
+  // 敵だるまの絵の幅（透明部分を除いた絵の幅）。塔の高さ SEG_H × SEGMENT_COUNT = 560 は台の上面 470 より高いので、
+  // 全段そろった状態ではだるまは画面の上端より外（足元 y = -90）にいて見えない。段が減るたび 80 ずつ降りてくる
+  const DARUMA_W = 168;
+  // 飛来物の投げ元の y の下限。だるまが画面の外にいる間も、時間停止時の飛来物が画面の中で止まるように押し込む
+  const THROW_Y_MIN = 70;
+  // 届かない拳（段が残っているうちにだるまを叩こうとしたときの空振り）
+  const WHIFF_MS = 380; // 伸びて消えるまで
+  const WHIFF_OUT_MS = 90; // 伸び切るまで
+  const WHIFF_GAP = 36; // だるまの足元からこれだけ手前で止まる
   // 段の色。脆い段は明るい木の色を交互に（隣の段と見分けるため）、硬い段は暗い石の色
   const FRAGILE_COLORS = ['#e3b566', '#d8a654'];
   const HARD_COLOR = '#575b63';
@@ -484,6 +493,13 @@
           tone(160, 70, t, 0.12, 0.3, 'triangle');
         }
       },
+      // 届かない拳：空を切る風の音だけ（打撃音は鳴らない）
+      whiff() {
+        if (!live()) return;
+        const t = ac.currentTime;
+        sweep(t, 0.2, 0.3, 700, 2600);
+        hiss(t + 0.02, 0.05, 0.1, 'highpass', 3000, 1);
+      },
       // 予約の印を付ける小さな音
       mark() {
         if (!live()) return;
@@ -579,6 +595,7 @@
   const blowing = []; // 奥へ吹っ飛んでいる段 { cx, cy, color, cracks, hits, id, age }
   const puffs = []; // 土煙 { x, y, vx, vy, r, age, dur }
   const lastPunch = [null, null]; // 手ごとの直近の拳 { tx, ty, start }
+  const whiffs = [null, null]; // 手ごとの届かない拳 { tx, ty, reach, start }。時間停止中に動くので lastPunch とは別に持つ
   const trails = []; // 残像 { hand, x, y, s, age }
   const impacts = []; // 衝撃 { x, y, age, dur, size, color }
   const shards = []; // 破片 { x, y, vx, vy, rot, vr, age, dur, color, w, h }
@@ -661,7 +678,8 @@
         id: nextProjId++,
         kind: rng() < 0.6 ? 'wood' : 'rock',
         ox: dg.cx + (rng() - 0.5) * 140,
-        oy: dg.cy + (rng() - 0.5) * 100,
+        // だるまが画面の外にいる間は、投げ元を画面の上端の少し下に押し込む（上から降ってくる見え方になる）
+        oy: Math.max(THROW_Y_MIN, dg.cy + (rng() - 0.5) * 100),
         dx: s.x + (rng() - 0.5) * 80,
         dy: s.y + (rng() - 0.5) * 60,
         z: 0,
@@ -723,6 +741,7 @@
     shells.length = 0;
     bursts.length = 0;
     lastPunch[0] = lastPunch[1] = null;
+    whiffs[0] = whiffs[1] = null;
     shakeMs = shakeAmp = 0;
     flash = null;
     banner = null;
@@ -761,6 +780,7 @@
     if (phase !== 'timestop') return;
     phase = 'replay';
     ui.showGo(false);
+    whiffs[0] = whiffs[1] = null; // 空振りの途中なら消して、再生の拳を手元から出す
     phaseTimer = 0;
     replayIdx = 0;
     replayPause = 0;
@@ -1025,10 +1045,12 @@
 
   // ---- 入力 ----
   // 時間停止中のクリック。飛来物 → 迎撃の予約、段 → その段を殴る予約（段のどこでも同じ）。
-  // だるま本体は最終段階（段が全部なくなって台に落ちた後）だけ予約できる。段が残っている間と何もない所は予約しない。
-  // 実入力とテスト用フックの両方がここを通る
+  // だるま本体は最終段階（段が全部なくなって台に落ちた後）だけ予約できる。段が残っている間に見えているだるまを叩くと、
+  // 予約は入らず「拳が届かない」空振りの反応だけ出る。何もない所は予約しない。
+  // 画面の外（塔の上の、まだ降りていない段など）はクリックできない。実入力とテスト用フックの両方がここを通る
   function handleClick(x, y) {
     if (phase !== 'timestop') return null;
+    if (x < 0 || x >= W || y < 0 || y >= H) return null;
     let best = null;
     let bestScore = 1;
     for (const p of projectiles) {
@@ -1056,16 +1078,34 @@
       sound.mark();
       return 'seg';
     }
-    if (finale && darumaAlive && !segments.length) {
+    if (darumaAlive) {
       const dg = darumaGeom();
       if (enemyView.inside(x - dg.cx, y - dg.cy)) {
-        queue.push({ type: 'daruma', x, y });
-        marks.push({ x, y, kind: 'daruma' });
-        sound.mark();
-        return 'daruma';
+        if (finale && !segments.length) {
+          queue.push({ type: 'daruma', x, y });
+          marks.push({ x, y, kind: 'daruma' });
+          sound.mark();
+          return 'daruma';
+        }
+        // まだ段の上にいるだるま：拳は届かない。予約もしない（連打しても増えない）。
+        // だるまが画面の外にいる間は、画面内の点が絵の中に入らないのでここには来ない
+        startWhiff(x, y, dg.bottom);
+        return 'whiff';
       }
     }
     return null;
+  }
+
+  // 届かない拳。クリック点に近い側の手が伸び、だるまの足元の手前（塔の上あたり）で止まって消える。
+  // 時間停止中に動くので lastPunch（再生の拳）とは別に持ち、残像は出さない
+  function startWhiff(x, y, darumaBottom) {
+    const hand = Math.abs(x - FIST_REST[0].x) <= Math.abs(x - FIST_REST[1].x) ? 0 : 1;
+    const rest = FIST_REST[hand];
+    const stopY = darumaBottom + WHIFF_GAP;
+    // 手元からクリック点へ向かう直線の上で、stopY の高さまでの割合。クリック点が足元に近いときも必ず手前で止める
+    const reach = clamp((rest.y - stopY) / Math.max(1, rest.y - y), 0.35, 0.8);
+    whiffs[hand] = { tx: x, ty: y, reach, start: clock };
+    sound.whiff();
   }
 
   // ---- 演出の部品 ----
@@ -1317,10 +1357,23 @@
     }
   }
 
+  // 拳の位置と大きさ。alpha は届かない拳が消えていくときだけ 1 未満になる
   function fistPose(hand) {
     const rest = FIST_REST[hand];
+    const wf = whiffs[hand];
+    if (wf) {
+      const e = clock - wf.start;
+      if (e < WHIFF_MS) {
+        // 伸び切ったら戻らず、その場で薄れて消える
+        const out = e < WHIFF_OUT_MS ? easeOut(e / WHIFF_OUT_MS) : 1;
+        const t = out * wf.reach;
+        const alpha = e < WHIFF_OUT_MS ? 1 : 1 - (e - WHIFF_OUT_MS) / (WHIFF_MS - WHIFF_OUT_MS);
+        return { x: lerp(rest.x, wf.tx, t), y: lerp(rest.y, wf.ty, t), s: 1 - 0.4 * t, alpha, moving: false };
+      }
+      whiffs[hand] = null;
+    }
     const p = lastPunch[hand];
-    if (!p) return { x: rest.x, y: rest.y, s: 1, moving: false };
+    if (!p) return { x: rest.x, y: rest.y, s: 1, alpha: 1, moving: false };
     const e = clock - p.start;
     let t;
     let moving = true;
@@ -1333,7 +1386,7 @@
       t = 0;
       moving = false;
     }
-    return { x: lerp(rest.x, p.tx, t), y: lerp(rest.y, p.ty, t), s: 1 - 0.4 * t, moving };
+    return { x: lerp(rest.x, p.tx, t), y: lerp(rest.y, p.ty, t), s: 1 - 0.4 * t, alpha: 1, moving };
   }
 
   // ---- 描画 ----
@@ -1539,6 +1592,7 @@
     const stopped = phase === 'timestop';
     for (let i = 0; i < segments.length; i++) {
       const v = segVisual(i);
+      if (v.cy + SEG_H / 2 + 8 < 0) continue; // 画面の上端より外にある段は描かない（並びは segments のまま保つ）
       ctx.save();
       ctx.translate(v.cx, v.cy);
       drawSegmentBody(ctx, segments[i]);
@@ -1898,7 +1952,7 @@
     for (const tr of trails) drawFist(ctx, tr.hand, tr.x, tr.y, tr.s, 0.35 * (1 - tr.age / 140));
     for (let hand = 0; hand < 2; hand++) {
       const f = fistPose(hand);
-      drawFist(ctx, hand, f.x, f.y, f.s, 1);
+      if (f.alpha > 0) drawFist(ctx, hand, f.x, f.y, f.s, f.alpha);
     }
     for (const s of shards) {
       ctx.save();
