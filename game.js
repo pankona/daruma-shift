@@ -53,11 +53,35 @@
   const darumaImage = new Image();
   let darumaImageReady = false;
   let darumaArtBox = null; // 画像内の「絵がある範囲」{x, y, w, h}（実ピクセル）
+  // 目入れ用：画像の目の位置（画像の画素座標）。x, y は中心、rx, ry は目の範囲の半径、r は入れる瞳の半径。
+  // 画素が読めないとき（file:// で開いた場合など、canvas が汚染されて getImageData が失敗する）は
+  // 目視で決めた概算値を使い、顔色の楕円を重ねて元の目を隠す。
+  const EYE_FALLBACK = [
+    { x: 40, y: 45, rx: 6.5, ry: 6.5, r: 4 },
+    { x: 56, y: 45, rx: 6.5, ry: 6.5, r: 4 },
+  ];
+  let darumaEyes = EYE_FALLBACK; // [向かって左, 向かって右]
+  let darumaFaceColor = '#fffcf5'; // 目を隠す顔色（画素が読めれば顔の最頻色に置き換える）
+  let darumaSprite = null; // 目の画素を顔色で消した複製（画素が読めたときだけ）
   darumaImage.onload = function () {
+    let px = null;
     try {
-      darumaArtBox = measureArtBox(darumaImage);
+      px = readPixels(darumaImage);
+      darumaArtBox = measureArtBox(px);
     } catch (e) {
       darumaArtBox = null; // 測れなければ画像全体を使う
+    }
+    if (px) {
+      try {
+        const found = findEyes(px);
+        if (found) {
+          darumaEyes = found.eyes;
+          darumaFaceColor = found.face;
+          darumaSprite = makeBlankSprite(px, found);
+        }
+      } catch (e) {
+        darumaSprite = null; // 見つからなければ概算値＋楕円のまま
+      }
     }
     darumaImageReady = true;
   };
@@ -66,18 +90,22 @@
   };
   darumaImage.src = 'assets/daruma.png';
 
-  // 透明部分を除いた、絵が描かれている範囲を測る
-  function measureArtBox(img) {
+  function readPixels(img) {
     const c = document.createElement('canvas');
     c.width = img.naturalWidth;
     c.height = img.naturalHeight;
     const g = c.getContext('2d');
     g.drawImage(img, 0, 0);
-    const data = g.getImageData(0, 0, c.width, c.height).data;
-    let minX = c.width, minY = c.height, maxX = -1, maxY = -1;
-    for (let y = 0; y < c.height; y++) {
-      for (let x = 0; x < c.width; x++) {
-        if (data[(y * c.width + x) * 4 + 3] > 8) {
+    return { w: c.width, h: c.height, data: g.getImageData(0, 0, c.width, c.height).data };
+  }
+
+  // 透明部分を除いた、絵が描かれている範囲を測る
+  function measureArtBox(px) {
+    const { w, h, data } = px;
+    let minX = w, minY = h, maxX = -1, maxY = -1;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        if (data[(y * w + x) * 4 + 3] > 8) {
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
@@ -89,6 +117,224 @@
     return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
   }
 
+  // 画像の画素から目の位置を測る。
+  // 顔（白っぽい画素）の枠の中にある墨の塊を連結成分に分け、白を囲んでいる（縁取りのある）丸い塊、
+  // なければ丸い塊のうち、顔の中心をはさんで左右に対で並ぶものを目とみなす。
+  // 返り値：{ eyes: [左, 右], face: 顔色の文字列, faceRGB: [r, g, b] }。見つからなければ null。
+  // mask が 1 の画素を 4近傍でつないだ連結成分（枠 [bx0,bx1]×[by0,by1] の中だけ見る）
+  function labelComponents(mask, w, bx0, by0, bx1, by1) {
+    const label = new Int32Array(mask.length); // 0 = 未割り当て
+    const comps = [];
+    for (let y = by0; y <= by1; y++) {
+      for (let x = bx0; x <= bx1; x++) {
+        const k0 = y * w + x;
+        if (!mask[k0] || label[k0]) continue;
+        const id = comps.length + 1;
+        const pixels = [];
+        const stack = [k0];
+        label[k0] = id;
+        let cx0 = x, cy0 = y, cx1 = x, cy1 = y;
+        while (stack.length) {
+          const q = stack.pop();
+          pixels.push(q);
+          const qx = q % w;
+          const qy = (q - qx) / w;
+          if (qx < cx0) cx0 = qx;
+          if (qx > cx1) cx1 = qx;
+          if (qy < cy0) cy0 = qy;
+          if (qy > cy1) cy1 = qy;
+          for (const [nx, ny] of [[qx - 1, qy], [qx + 1, qy], [qx, qy - 1], [qx, qy + 1]]) {
+            if (nx < bx0 || nx > bx1 || ny < by0 || ny > by1) continue;
+            const nk = ny * w + nx;
+            if (mask[nk] && !label[nk]) {
+              label[nk] = id;
+              stack.push(nk);
+            }
+          }
+        }
+        comps.push({ id, pixels, area: pixels.length, x0: cx0, y0: cy0, x1: cx1, y1: cy1 });
+      }
+    }
+    return { label, comps };
+  }
+
+  function findEyes(px) {
+    const { w, h, data } = px;
+    const n = w * h;
+    const dark = new Uint8Array(n); // 墨：輝度 80 未満
+    const white = new Uint8Array(n); // 白っぽい：顔と目の白
+    for (let k = 0; k < n; k++) {
+      const i = k * 4;
+      if (data[i + 3] <= 8) continue;
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      if ((r + g + b) / 3 < 80) dark[k] = 1;
+      else if (r > 185 && g > 185 && b > 165) white[k] = 1;
+    }
+
+    // 顔：いちばん大きい白の連結成分（体のつやなど、小さな白は無視する）
+    const faceComp = labelComponents(white, w, 0, 0, w - 1, h - 1).comps.sort((a, b) => b.area - a.area)[0];
+    if (!faceComp) return null;
+    const fx0 = faceComp.x0, fy0 = faceComp.y0, fx1 = faceComp.x1, fy1 = faceComp.y1;
+    const faceW = fx1 - fx0 + 1;
+    const faceH = fy1 - fy0 + 1;
+    const faceCx = (fx0 + fx1 + 1) / 2;
+    // 顔の色：顔の画素の最頻色
+    const faceColors = new Map();
+    for (const k of faceComp.pixels) {
+      const i = k * 4;
+      const key = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
+      faceColors.set(key, (faceColors.get(key) || 0) + 1);
+    }
+    let faceKey = 0, faceMax = -1;
+    for (const [key, cnt] of faceColors) {
+      if (cnt > faceMax) {
+        faceMax = cnt;
+        faceKey = key;
+      }
+    }
+    const faceRGB = [(faceKey >> 16) & 255, (faceKey >> 8) & 255, faceKey & 255];
+
+    // 顔の枠（1px 広げる）の中の墨の連結成分
+    const bx0 = Math.max(0, fx0 - 1), by0 = Math.max(0, fy0 - 1);
+    const bx1 = Math.min(w - 1, fx1 + 1), by1 = Math.min(h - 1, fy1 + 1);
+    const { label, comps } = labelComponents(dark, w, bx0, by0, bx1, by1);
+
+    // 各成分が囲んでいる画素：成分の枠の縁から成分以外の画素をたどり、届かなかった画素
+    for (const c of comps) {
+      const ex0 = Math.max(0, c.x0 - 1), ey0 = Math.max(0, c.y0 - 1);
+      const ex1 = Math.min(w - 1, c.x1 + 1), ey1 = Math.min(h - 1, c.y1 + 1);
+      const seen = new Set();
+      const stack = [];
+      const push = (x, y) => {
+        const k = y * w + x;
+        if (label[k] === c.id || seen.has(k)) return;
+        seen.add(k);
+        stack.push(k);
+      };
+      for (let x = ex0; x <= ex1; x++) {
+        push(x, ey0);
+        push(x, ey1);
+      }
+      for (let y = ey0; y <= ey1; y++) {
+        push(ex0, y);
+        push(ex1, y);
+      }
+      while (stack.length) {
+        const q = stack.pop();
+        const qx = q % w;
+        const qy = (q - qx) / w;
+        if (qx > ex0) push(qx - 1, qy);
+        if (qx < ex1) push(qx + 1, qy);
+        if (qy > ey0) push(qx, qy - 1);
+        if (qy < ey1) push(qx, qy + 1);
+      }
+      c.enclosed = [];
+      for (let y = ey0; y <= ey1; y++) {
+        for (let x = ex0; x <= ex1; x++) {
+          const k = y * w + x;
+          if (label[k] !== c.id && !seen.has(k)) c.enclosed.push(k);
+        }
+      }
+      c.w = c.x1 - c.x0 + 1;
+      c.h = c.y1 - c.y0 + 1;
+      c.cx = (c.x0 + c.x1 + 1) / 2;
+      c.cy = (c.y0 + c.y1 + 1) / 2;
+    }
+
+    const cands = comps.filter((c) => c.area <= (faceW * faceH) / 3 && c.w >= 2 && c.h >= 2);
+    const round = (c) => c.w / c.h >= 0.5 && c.w / c.h <= 2;
+    // 左右の対：横に離れ、高さがそろい、大きさが近く、中点が顔の中心の近く
+    function pairs(list) {
+      const out = [];
+      for (const a of list) {
+        for (const b of list) {
+          if (a.cx >= b.cx || a.x1 >= b.x0) continue;
+          if (Math.abs(a.cy - b.cy) > Math.max(a.h, b.h)) continue;
+          if (Math.max(a.area, b.area) / Math.min(a.area, b.area) > 2.5) continue;
+          if (Math.abs((a.cx + b.cx) / 2 - faceCx) > faceW * 0.15) continue;
+          out.push([a, b]);
+        }
+      }
+      return out;
+    }
+    let ps = pairs(cands.filter((c) => c.enclosed.length > 0 && round(c)));
+    let solid = false; // 縁取りのない塗りつぶしの目
+    if (!ps.length) {
+      ps = pairs(cands.filter(round));
+      solid = true;
+    }
+    let best = null;
+    for (const p of ps) {
+      const score = p[0].area + p[1].area + p[0].enclosed.length + p[1].enclosed.length;
+      if (!best || score > best.score) best = { pair: p, score };
+    }
+    if (!best) return null;
+
+    // 目の範囲：成分＋囲んだ画素＋成分の枠の中にある小さな墨の塊（縁取りが開いていて囲めなかった瞳など）。
+    // 枠に少しかかる大きな塊（眉の端）は巻き込まない
+    const eyes = best.pair.map((c) => {
+      const region = new Set(c.pixels);
+      for (const k of c.enclosed) region.add(k);
+      for (let y = c.y0; y <= c.y1; y++) {
+        for (let x = c.x0; x <= c.x1; x++) {
+          const k = y * w + x;
+          if (!dark[k] || label[k] === c.id) continue;
+          const other = label[k] ? comps[label[k] - 1] : null;
+          if (other && other.area < c.area * 0.6) region.add(k);
+        }
+      }
+      let x0 = w, y0 = h, x1 = -1, y1 = -1;
+      for (const k of region) {
+        const x = k % w;
+        const y = (k - x) / w;
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+      }
+      const rx = (x1 - x0 + 1) / 2;
+      const ry = (y1 - y0 + 1) / 2;
+      return {
+        x: (x0 + x1 + 1) / 2,
+        y: (y0 + y1 + 1) / 2,
+        rx,
+        ry,
+        r: Math.max(1.5, (solid ? 0.8 : 0.6) * Math.min(rx, ry)),
+        region,
+      };
+    });
+    // 妥当性：丸い、大きさが近い、高さがそろう。外れていたら概算値に任せる
+    for (const e of eyes) {
+      const asp = e.rx / e.ry;
+      if (asp < 0.55 || asp > 1.8 || e.rx < 2 || e.rx > faceW * 0.3) return null;
+    }
+    if (Math.abs(eyes[0].y - eyes[1].y) > 3) return null;
+    if (Math.max(eyes[0].rx, eyes[1].rx) / Math.min(eyes[0].rx, eyes[1].rx) > 1.6) return null;
+    return { eyes, face: `rgb(${faceRGB[0]},${faceRGB[1]},${faceRGB[2]})`, faceRGB };
+  }
+
+  // 目の画素を顔色で塗りつぶした複製を作る（「まだ目が入っていない」だるま）
+  function makeBlankSprite(px, found) {
+    const c = document.createElement('canvas');
+    c.width = px.w;
+    c.height = px.h;
+    const g = c.getContext('2d');
+    const id = g.createImageData(px.w, px.h);
+    id.data.set(px.data);
+    const [r, gg, b] = found.faceRGB;
+    for (const e of found.eyes) {
+      for (const k of e.region) {
+        const i = k * 4;
+        id.data[i] = r;
+        id.data[i + 1] = gg;
+        id.data[i + 2] = b;
+        id.data[i + 3] = 255;
+      }
+    }
+    g.putImageData(id, 0, 0);
+    return c;
+  }
+
   const BLOCK_TYPES = {
     normal: { friction: 0.35, frictionStatic: 0.6, density: 0.001 },
     slippery: { friction: 0.02, frictionStatic: 0.03, density: 0.001 },
@@ -98,6 +344,9 @@
   // ---- 面の定義 ------------------------------------------------------
   // platforms: 台（x は中心、top は上面、w は横幅）。台は床まで伸びる。
   // blocks: 下から順の段。stackOn の台の上に積み、stackX があればその位置に積む。
+  // blockH: その面だけの段の高さ（省略時は BLOCK_H）
+  // restAtStart: 真なら、積んだ全ボディを最初から眠らせる（叩くまで物理が一切動かない）
+  // finale: 真なら最終面。クリア時に花火が上がる
   // goal: 'lower' = 全部の段を抜いて、だるまを台の上に降ろす
   //       'carry' = だるまを target の台の上に運ぶ
   const STAGES = [
@@ -131,12 +380,61 @@
       blocks: ['normal', 'normal', 'normal', 'normal', 'normal'],
       target: 1,
     },
+    {
+      name: '面四　大塔',
+      goal: 'lower',
+      // 通常の高さ（36）の段を10段積んだ塔。台の上面を 470 まで下げて論理画面に収める：
+      // 470 − 36×10 = 110 が塔の天辺、だるまの頭は約 34。
+      // 段を薄く（26）して12段にする案は、塔が不安定で弱い一打でも倒れたため採らない。
+      // 重い段を下寄りに1つ、滑る段を中ほどに1つ。残りは数の圧で見せる。
+      // 最終面（finale）では物理の刻みを半分にして2回進め、叩いた段の摩擦をその一打に限りゼロにする
+      // （step() と applyStrike() を参照）。強い一打で最下段を抜いても塔が倒れないようにするため。
+      platforms: [{ x: 480, top: 470, w: 160 }],
+      stackOn: 0,
+      blocks: ['normal', 'normal', 'heavy', 'normal', 'normal', 'normal', 'slippery', 'normal', 'normal', 'normal'],
+      target: 0,
+      restAtStart: true,
+      finale: true,
+    },
   ];
 
   const GOAL_TEXT = {
     lower: '段を全部抜いて、だるまを台に降ろせ',
     carry: 'だるまを右の台へ運べ',
   };
+
+  // ---- 達磨の目入れ（通しの進行） ---------------------------------------
+  // クリア済みの最大の面番号（0〜STAGES.length）を localStorage に保つ。単調に増え、面選択で戻っても減らない。
+  // 目の段階：0 = 筆を入れていない、1 = 輪郭、2 = 瞳まで。
+  // 面一クリアで向かって左の目に輪郭、面二で左目が完成、面三で右目に輪郭、面四で両目完成。
+  const PROGRESS_KEY = 'daruma-shift.cleared';
+  let cleared = loadProgress();
+
+  function loadProgress() {
+    try {
+      const v = parseInt(localStorage.getItem(PROGRESS_KEY), 10);
+      return Number.isFinite(v) ? Math.max(0, Math.min(STAGES.length, v)) : 0;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  function saveProgress() {
+    try {
+      localStorage.setItem(PROGRESS_KEY, String(cleared));
+    } catch (e) {
+      // 保存できない環境（プライベートモード等）では、その場の進行だけで続ける
+    }
+  }
+
+  function eyeStages(level) {
+    return { left: Math.max(0, Math.min(2, level)), right: Math.max(0, Math.min(2, level - 2)) };
+  }
+
+  // 進行の段階 lv（1〜4）で足される筆：どちらの目の、輪郭(1)か瞳(2)か
+  function strokeOf(lv) {
+    return { side: lv <= 2 ? 'left' : 'right', stage: ((lv - 1) % 2) + 1 };
+  }
 
   // ---- 状態 ----------------------------------------------------------
   const engine = Engine.create();
@@ -193,19 +491,20 @@
 
     const base = stage.platforms[stage.stackOn];
     const sx = stage.stackX != null ? stage.stackX : base.x;
+    const bh = stage.blockH || BLOCK_H;
     blocks = stage.blocks.map((type, i) => {
       const props = BLOCK_TYPES[type];
-      const body = Bodies.rectangle(sx, base.top - BLOCK_H / 2 - i * BLOCK_H, BLOCK_W, BLOCK_H, {
+      const body = Bodies.rectangle(sx, base.top - bh / 2 - i * bh, BLOCK_W, bh, {
         label: 'block',
         friction: props.friction,
         frictionStatic: props.frictionStatic,
         density: props.density,
         restitution: 0,
       });
-      return { body, type, removed: false, index: i };
+      return { body, type, removed: false, index: i, h: bh };
     });
 
-    const stackTop = base.top - stage.blocks.length * BLOCK_H;
+    const stackTop = base.top - stage.blocks.length * bh;
     // chamfer の半径は 左上・右上・右下・左下 の順。下辺は平らに残す。
     daruma = Bodies.rectangle(sx, stackTop - DARUMA_H / 2, DARUMA_W, DARUMA_H, {
       label: 'daruma',
@@ -224,6 +523,10 @@
     darumaShapeOffsetY = (daruma.bounds.min.y + daruma.bounds.max.y) / 2 - daruma.position.y;
 
     Composite.add(engine.world, [floor, ...platforms.map((p) => p.body), ...blocks.map((b) => b.body), daruma]);
+
+    // 最初から眠らせる面：眠っているボディには重力も当たらず、叩いて起こすまで一切動かない。
+    // 段をぴったり接して置いてあるので、起きた時点の姿勢は積んだとおり。
+    if (stage.restAtStart) for (const body of dynamicBodies()) Sleeping.set(body, true);
 
     phase = 'ready';
     result = null;
@@ -283,7 +586,14 @@
   }
 
   function step() {
-    Engine.update(engine, STEP_MS);
+    if (stage.finale) {
+      // 最終面だけ刻みを半分にして2回進める。接触の計算が細かくなり、抜いた段の落下がまっすぐになる。
+      // 全画面に広げると面一のパワー0.5の挙動が変わる（段が抜けて塔が倒れる）ため、ここに限定する。
+      Engine.update(engine, STEP_MS / 2);
+      Engine.update(engine, STEP_MS / 2);
+    } else {
+      Engine.update(engine, STEP_MS);
+    }
     simSteps++;
 
     // 画面外へ飛んだ段は世界から外す（以後「台の上から無くなった」扱い）
@@ -362,6 +672,14 @@
     result = 'clear';
     aim = null;
     fx.onWin();
+    // 目入れの進行：初めて到達した面なら進め、足された筆を演出で見せる
+    const n = stageIndex + 1;
+    if (n > cleared) {
+      const prev = cleared;
+      cleared = n;
+      saveProgress();
+      fx.onEyeInk(prev, n);
+    }
     emitResult();
   }
 
@@ -397,6 +715,12 @@
     if (p <= 0) return false;
     // 眠っているボディは setVelocity だけでは動かない。全ボディを起こしてから叩く。
     for (const body of dynamicBodies()) Sleeping.set(body, false);
+    if (stage.finale) {
+      // 最終面だけ、叩いた段の摩擦をこの一打に限りゼロにする。本物のだるまおとしで、木槌の一撃では
+      // 段が摩擦で上の段を引きずる前に抜け飛ぶ挙動に寄せる。他の面では触らない。
+      b.body.friction = 0;
+      b.body.frictionStatic = 0;
+    }
     Body.setVelocity(b.body, { x: dir.x * p * MAX_SPEED, y: dir.y * p * MAX_SPEED });
     phase = 'moving';
     restFrames = 0;
@@ -558,11 +882,12 @@
     ctx.save();
     ctx.translate(ps.x, ps.y);
     ctx.rotate(ps.angle);
+    const bh = b.h;
     const hw = BLOCK_W / 2;
-    const hh = BLOCK_H / 2;
+    const hh = bh / 2;
 
     const hovered = aim && aim.block === b;
-    roundRectPath(ctx, -hw, -hh, BLOCK_W, BLOCK_H, BLOCK_CORNER);
+    roundRectPath(ctx, -hw, -hh, BLOCK_W, bh, BLOCK_CORNER);
     ctx.fillStyle = st.fill;
     ctx.fill();
     ctx.save();
@@ -588,7 +913,7 @@
 
     ctx.strokeStyle = INK;
     ctx.lineWidth = hovered ? 3 : 2;
-    roundRectPath(ctx, -hw, -hh, BLOCK_W, BLOCK_H, BLOCK_CORNER);
+    roundRectPath(ctx, -hw, -hh, BLOCK_W, bh, BLOCK_CORNER);
     ctx.stroke();
 
     if (b.type === 'heavy') {
@@ -665,8 +990,60 @@
     ctx.save();
     applyDarumaTransform(ctx, body);
     ctx.imageSmoothingEnabled = false; // ドット絵をくっきり見せる
-    ctx.drawImage(img, dx, dy, dw, dh);
+    // 目の画素を消した複製があればそれを、なければ元の絵を描いて目の上に顔色の楕円を重ねる
+    ctx.drawImage(darumaSprite || img, dx, dy, dw, dh);
+    const eyes = darumaEyes.map((e) => ({
+      x: dx + e.x * scale,
+      y: dy + e.y * scale,
+      r: e.r * scale,
+      mx: (e.rx + 1) * scale,
+      my: (e.ry + 1) * scale,
+    }));
+    drawEyeInk(ctx, eyes, !darumaSprite, darumaFaceColor);
     ctx.restore();
+  }
+
+  // 目入れの描画。eyes はだるまの座標系（外形の中心が原点）での [向かって左, 向かって右]。
+  // x, y は目の中心、r は瞳の半径、mx, my は元の目を隠す楕円の半径。
+  // 段階は保存された進行（cleared）から、足されたばかりの筆は fx の進みに合わせて途中まで描く。
+  function drawEyeInk(ctx, eyes, mask, faceColor) {
+    const st = eyeStages(cleared);
+    const sides = ['left', 'right'];
+    for (let i = 0; i < 2; i++) {
+      const e = eyes[i];
+      if (mask) {
+        ctx.fillStyle = faceColor;
+        ctx.beginPath();
+        ctx.ellipse(e.x, e.y, e.mx, e.my, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      const target = st[sides[i]];
+      const lw = Math.max(1.2, e.r * 0.28);
+      if (target >= 1) {
+        // 輪郭：上から時計回りに筆を回す
+        const p = fx.inkProgress(sides[i], 1);
+        if (p > 0) {
+          ctx.strokeStyle = INK;
+          ctx.lineWidth = lw;
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.arc(e.x, e.y, e.r, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * p);
+          ctx.stroke();
+        }
+      }
+      if (target >= 2) {
+        // 瞳：中心から墨の点がスッと広がる（わずかに行き過ぎて戻る）
+        const p = fx.inkProgress(sides[i], 2);
+        if (p > 0) {
+          const q = p - 1;
+          const k = Math.max(0, 1 + 2.7 * q * q * q + 1.7 * q * q);
+          ctx.fillStyle = INK;
+          ctx.beginPath();
+          ctx.arc(e.x, e.y, (e.r + lw / 2) * k, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
   }
 
   // 仮描画（画像が読み込めなかった場合のフォールバック）
@@ -700,13 +1077,16 @@
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // 目
-    ctx.fillStyle = INK;
-    for (const sx of [-1, 1]) {
-      ctx.beginPath();
-      ctx.arc(sx * 12, -3, worried ? 3.2 : 4.2, 0, Math.PI * 2);
-      ctx.fill();
-    }
+    // 目（目入れの進行に従う。仮描画には元の目が無いので隠す楕円は要らない）
+    drawEyeInk(
+      ctx,
+      [
+        { x: -12, y: -3, r: 4.2, mx: 0, my: 0 },
+        { x: 12, y: -3, r: 4.2, mx: 0, my: 0 },
+      ],
+      false,
+      null
+    );
 
     // 眉
     ctx.strokeStyle = INK;
@@ -898,6 +1278,28 @@
         if (!live()) return;
         tone(120, 72, ac.currentTime, 0.4, 0.45, 'triangle');
       },
+      // 目入れ：筆が紙を擦る短い音（静かに）
+      ink() {
+        if (!live()) return;
+        const t = ac.currentTime;
+        hiss(t, 0.12, 0.08, 'bandpass', 1800, 1.2);
+        hiss(t + 0.02, 0.16, 0.06, 'bandpass', 700, 1.5);
+      },
+      // 花火の打ち上げ：細く上がる笛
+      whistle() {
+        if (!live()) return;
+        tone(500, 1400, ac.currentTime, 0.42, 0.045, 'sine');
+      },
+      // 花火の開く音：腹に響く低い破裂と、あとに続くパチパチ
+      boom(i) {
+        if (!live()) return;
+        const t = ac.currentTime;
+        const f = 70 + (i % 3) * 8;
+        tone(f, 32, t, 0.7, 0.9, 'sine');
+        hiss(t, 0.3, 0.55, 'lowpass', 240, 0.8);
+        hiss(t, 0.06, 0.3, 'bandpass', 900, 0.9);
+        for (let k = 0; k < 7; k++) hiss(t + 0.15 + k * 0.07 + Math.random() * 0.04, 0.025, 0.1, 'highpass', 2600, 1);
+      },
     };
   })();
 
@@ -954,6 +1356,10 @@
     let banner = null;
     const sparks = [];
     const petals = [];
+    const inks = []; // 足されたばかりの筆 { side, stage, delay, dur, age, sounded }
+    const shells = []; // 花火の玉（打ち上げ中） { at, x, y, color, rise, age, launched, px, py, t }
+    const bursts = []; // 開いた火花
+    let boomCount = 0;
     const cam = { z: 1, target: 1, holdMs: 0, fx: W / 2, fy: H / 2, cx: W / 2, cy: H / 2 };
 
     function reset() {
@@ -965,7 +1371,64 @@
       flash = banner = null;
       sparks.length = 0;
       petals.length = 0;
+      inks.length = 0;
+      shells.length = 0;
+      bursts.length = 0;
+      boomCount = 0;
       Object.assign(cam, { z: 1, target: 1, holdMs: 0, fx: W / 2, fy: H / 2, cx: W / 2, cy: H / 2 });
+    }
+
+    // 最終面の花火：約2秒の間に6発。朱・金・白・藍の順で、画面の上の方に散らして開く
+    function spawnFireworks() {
+      const plan = [
+        { at: 200, x: 300, y: 150, color: WA.shu },
+        { at: 600, x: 680, y: 120, color: WA.kin },
+        { at: 950, x: 470, y: 90, color: WA.shiro },
+        { at: 1300, x: 200, y: 170, color: WA.ai },
+        { at: 1650, x: 760, y: 150, color: WA.shu },
+        { at: 2000, x: 500, y: 125, color: WA.kin },
+      ];
+      for (const s of plan) {
+        shells.push({ ...s, rise: 420 + Math.random() * 120, age: 0, launched: false, px: s.x, py: H + 10, t: 0 });
+      }
+    }
+
+    // 玉が開く：外の輪（円形に均等）と、内の小さな輪（白）
+    function burst(s) {
+      const outer = 46;
+      for (let i = 0; i < outer; i++) {
+        const ang = (i / outer) * Math.PI * 2 + (Math.random() - 0.5) * 0.08;
+        const sp = 0.17 + Math.random() * 0.03;
+        bursts.push({
+          x: s.x,
+          y: s.y,
+          vx: Math.cos(ang) * sp,
+          vy: Math.sin(ang) * sp,
+          life: 850 + Math.random() * 350,
+          age: 0,
+          color: s.color,
+          size: 1.6 + Math.random() * 1.2,
+          ph: Math.random() * Math.PI * 2,
+        });
+      }
+      const inner = 18;
+      for (let i = 0; i < inner; i++) {
+        const ang = (i / inner) * Math.PI * 2 + 0.17;
+        const sp = 0.085 + Math.random() * 0.02;
+        bursts.push({
+          x: s.x,
+          y: s.y,
+          vx: Math.cos(ang) * sp,
+          vy: Math.sin(ang) * sp,
+          life: 700 + Math.random() * 250,
+          age: 0,
+          color: s.color === WA.shiro ? WA.kin : WA.shiro,
+          size: 1.2 + Math.random() * 0.8,
+          ph: Math.random() * Math.PI * 2,
+        });
+      }
+      bursts.push({ x: s.x, y: s.y, vx: 0, vy: 0, life: 170, age: 0, flash: true });
+      sound.boom(boomCount++);
     }
 
     function zoom(z, holdMs) {
@@ -1044,7 +1507,7 @@
         shakeAmp = Math.min(SHAKE_MAX, 1 + 4 * p);
         shakeMs = SHAKE_MS;
         // 打点：槌が当たる側の面（叩く向きの反対側）
-        spawnSparks(b.body.position.x - (dir.x * BLOCK_W) / 2, b.body.position.y - (dir.y * BLOCK_H) / 2, dir, p);
+        spawnSparks(b.body.position.x - (dir.x * BLOCK_W) / 2, b.body.position.y - (dir.y * b.h) / 2, dir, p);
         sound.strike(p);
       },
 
@@ -1075,6 +1538,23 @@
         spawnPetals();
         zoom(1.25, 1100);
         sound.clear();
+        if (stage.finale) spawnFireworks();
+      },
+
+      // 目入れの進行が from から to へ進んだ。足された筆を順に、少し間を置いて入れる
+      onEyeInk(from, to) {
+        for (let lv = from + 1, k = 0; lv <= to; lv++, k++) {
+          const s = strokeOf(lv);
+          inks.push({ side: s.side, stage: s.stage, delay: 320 + k * 380, dur: 420, age: 0, sounded: false });
+        }
+      },
+
+      // その筆の進み（0〜1）。いま足している最中でなければ 1（描き終わっている）
+      inkProgress(side, stageNo) {
+        for (const a of inks) {
+          if (a.side === side && a.stage === stageNo) return Math.max(0, Math.min(1, (a.age - a.delay) / a.dur));
+        }
+        return 1;
       },
 
       onLose() {
@@ -1194,6 +1674,51 @@
         }
 
         if (banner) banner.age += dt;
+
+        // 目入れの筆
+        for (const a of inks) {
+          a.age += dt;
+          if (!a.sounded && a.age >= a.delay) {
+            a.sounded = true;
+            sound.ink();
+          }
+        }
+
+        // 花火：打ち上げ（下端から開く位置まで、減速しながら上がる）→ 開く
+        for (let i = shells.length - 1; i >= 0; i--) {
+          const s = shells[i];
+          s.age += dt;
+          if (s.age < s.at) continue;
+          if (!s.launched) {
+            s.launched = true;
+            sound.whistle();
+          }
+          const t = (s.age - s.at) / s.rise;
+          if (t >= 1) {
+            burst(s);
+            shells.splice(i, 1);
+            continue;
+          }
+          const k = 1 - (1 - t) * (1 - t);
+          s.t = t;
+          s.py = H + 10 - (H + 10 - s.y) * k;
+          s.px = s.x + Math.sin(t * 9) * 4 * (1 - t);
+        }
+        for (let i = bursts.length - 1; i >= 0; i--) {
+          const b = bursts[i];
+          b.age += dt;
+          if (b.age >= b.life) {
+            bursts.splice(i, 1);
+            continue;
+          }
+          if (b.flash) continue;
+          const drag = Math.exp(-dt / 900);
+          b.vx *= drag;
+          b.vy *= drag;
+          b.vy += 0.00022 * dt;
+          b.x += b.vx * dt;
+          b.y += b.vy * dt;
+        }
       },
 
       applyCamera(ctx) {
@@ -1327,6 +1852,57 @@
           ctx.restore();
         }
 
+        // 花火（最終面のクリアだけ。画面に固定して、空の遠景として描く）
+        if (shells.length || bursts.length) {
+          ctx.save();
+          ctx.lineCap = 'round';
+          for (const s of shells) {
+            if (!s.launched) continue;
+            // 上がる玉：金の点と、下へ伸びる薄い尾
+            ctx.globalAlpha = 1;
+            ctx.strokeStyle = 'rgba(42,37,34,0.3)';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(s.px, s.py);
+            ctx.lineTo(s.px, s.py + 26 * (1 - s.t) + 6);
+            ctx.stroke();
+            ctx.fillStyle = WA.kin;
+            ctx.beginPath();
+            ctx.arc(s.px, s.py, 2.4, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          for (const b of bursts) {
+            const k = 1 - b.age / b.life;
+            if (b.flash) {
+              // 開いた瞬間の閃き
+              ctx.globalAlpha = k * 0.9;
+              ctx.fillStyle = '#ffffff';
+              ctx.strokeStyle = WA.kin;
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.arc(b.x, b.y, 10 + 34 * (1 - k), 0, Math.PI * 2);
+              ctx.fill();
+              ctx.stroke();
+              continue;
+            }
+            // 終わり際は瞬きながら消える。白と金は紙に溶けるので薄い墨の縁を下に敷く
+            const twinkle = k < 0.45 ? 0.55 + 0.45 * Math.sin(b.age * 0.045 + b.ph) : 1;
+            ctx.globalAlpha = Math.min(1, k * 2.2) * twinkle;
+            const tx = b.x - b.vx * 14;
+            const ty = b.y - b.vy * 14;
+            ctx.strokeStyle = 'rgba(42,37,34,0.35)';
+            ctx.lineWidth = b.size + 1.6;
+            ctx.beginPath();
+            ctx.moveTo(b.x, b.y);
+            ctx.lineTo(tx, ty);
+            ctx.stroke();
+            ctx.strokeStyle = b.color;
+            ctx.lineWidth = b.size;
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+
         // 筆文字（一瞬だけ）
         const DUR = 1700;
         if (banner && banner.age < DUR) {
@@ -1437,10 +2013,12 @@
       resultText.textContent = r === 'clear' ? 'おみごと' : 'だるまが落ちた';
       resultText.className = r === 'clear' ? 'win' : 'lose';
       btnNext.textContent = stageIndex === STAGES.length - 1 ? '最初の面へ' : '次の面';
-      // 失敗表示は少しだけ間を置いて、落ちる様子を見せる。クリアは筆文字と寄りを先に見せる
+      // 失敗表示は少しだけ間を置いて、落ちる様子を見せる。クリアは筆文字と寄りを先に見せる。
+      // 最終面は花火が上がり切るまで待つ
+      const wait = r === 'clear' ? (stage.finale ? 2800 : 900) : 700;
       setTimeout(() => {
         if (result === r) resultEl.hidden = false;
-      }, r === 'clear' ? 900 : 700);
+      }, wait);
     });
 
     // 固定ステップのループ。狙っている間とヒットストップ中はエンジンの更新を止める。
@@ -1518,6 +2096,7 @@
         restFrames,
         strikes,
         simSteps,
+        cleared,
         daruma: { ...bodyState(daruma), onTarget: darumaRestingOn(target) },
         blocks: blocks.map((b) => ({
           index: b.index,
@@ -1536,6 +2115,14 @@
     // 演出用の判定（ヒヤリ・スローの条件）の現在値。演出の調整・確認用
     danger() {
       return fx.danger();
+    },
+    // 目入れの進行。引数なしで読む。n を渡すとクリア済みの最大面を n に置き換えて保存する（確認用）
+    progress(n) {
+      if (n != null) {
+        cleared = Math.max(0, Math.min(STAGES.length, Math.floor(n)));
+        saveProgress();
+      }
+      return { cleared, eyes: eyeStages(cleared), eyePixels: darumaEyes.map((e) => ({ x: e.x, y: e.y, rx: e.rx, ry: e.ry, r: e.r })), eyesDetected: !!darumaSprite };
     },
     // 物理を n ステップ同期で進める（自動テスト・ヘッドレス用）
     step(n = 1) {
