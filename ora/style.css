@@ -1,0 +1,142 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #2b2622;
+  color: #2a2522;
+  font-family: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", serif;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* 論理画面 960x540。game.js が transform で拡大縮小して中央に置く（既存ゲームと同じ手法） */
+#stage-wrap {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 960px;
+  height: 540px;
+  transform-origin: 0 0;
+  background: #f3ead8;
+}
+
+#game {
+  display: block;
+  width: 960px;
+  height: 540px;
+  touch-action: none;
+}
+
+#hud {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  display: flex;
+  justify-content: flex-end;
+  padding: 14px 18px;
+  pointer-events: none;
+}
+
+#hud button {
+  pointer-events: auto;
+}
+
+button {
+  font: inherit;
+  font-size: 16px;
+  color: #2a2522;
+  background: #fbf6ea;
+  border: 1.5px solid #2a2522;
+  border-radius: 4px;
+  padding: 4px 12px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+button:hover {
+  background: #efe3c8;
+}
+
+button:active {
+  background: #e4d4b0;
+}
+
+button[hidden] {
+  display: none;
+}
+
+/* 発動：時間停止中だけ見せる。背景が反転するので濃い色で浮かせる */
+#btn-go {
+  font-size: 22px;
+  letter-spacing: 0.2em;
+  padding: 8px 26px;
+  color: #fbf6ea;
+  background: #b3261e;
+  border-color: #fbf6ea;
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.35);
+}
+
+#btn-go:hover {
+  background: #cf3a2d;
+}
+
+#title,
+#result {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(243, 234, 216, 0.55);
+}
+
+#title[hidden],
+#result[hidden] {
+  display: none;
+}
+
+.box {
+  min-width: 360px;
+  padding: 26px 34px 22px;
+  text-align: center;
+  background: #fbf6ea;
+  border: 2px solid #2a2522;
+  border-radius: 6px;
+  box-shadow: 4px 4px 0 rgba(42, 37, 34, 0.25);
+}
+
+#title h1 {
+  margin: 0 0 10px;
+  font-size: 32px;
+  font-weight: normal;
+  letter-spacing: 0.12em;
+}
+
+#title p {
+  margin: 0 0 18px;
+  font-size: 15px;
+  color: #5a4f48;
+}
+
+#result-text {
+  font-size: 36px;
+  letter-spacing: 0.15em;
+  margin-bottom: 18px;
+}
+
+#result-text.win {
+  color: #b3261e;
+}
+
+#btn-start,
+#btn-retry {
+  font-size: 18px;
+  padding: 6px 22px;
+}

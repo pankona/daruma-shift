@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>オラオラだるま（試作）</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="stage-wrap">
+    <canvas id="game" width="960" height="540"></canvas>
+
+    <div id="hud">
+      <button id="btn-go" hidden>発動</button>
+    </div>
+
+    <div id="title">
+      <div class="box">
+        <h1>オラオラだるま（試作）</h1>
+        <p>時が止まっている間に、飛来物と敵だるまを叩く場所を決める</p>
+        <button id="btn-start">開始</button>
+      </div>
+    </div>
+
+    <div id="result" hidden>
+      <div class="box">
+        <div id="result-text"></div>
+        <button id="btn-retry">もう一度</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="game.js"></script>
+</body>
+</html>
