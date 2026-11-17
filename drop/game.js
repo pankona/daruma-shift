@@ -6,7 +6,9 @@
 // 完全に画面の外にいる。段を吹っ飛ばすたびに次の巨大な段が上から落ちてくる。
 // 最後の段を吹っ飛ばすとだるまが画面の上から落ちてきて台に着地し、最終段階として本体を殴れるようになる。耐久が尽きたら破裂して勝ち。
 // 戦闘開始の導入：台は空で、塔全体が画面の上から落ちてきて一番下の段が台に着地する（段が吹っ飛んだあとの落下と同じ重さ）。
-// 脆い段は巨大な丸太としてコードで描く（円柱の陰影・樹皮の筋・節・両端の木口と年輪。模様は段ごとのシードで決めて保持する）。
+// 脆い段は縦に積んだ丸太の輪切りとしてコードで描く。主観視点では静止中の段は樹皮の側面しか見えない（上面は画面の上、底面は台や下の段に接している）ので、
+// 木口（切り口と年輪）は「落下中の段の底面」と「枝の切り株」にだけ出す。輪郭は左右が垂直、上端は ∩ の弧、下端は ∪ の弧（水平線 y=440 からの距離で膨らみが決まる）。
+// 陰影は左右方向（光の帯は中央より少し左）、樹皮の筋は縦に流れる波線。模様は段ごとのシードで決めて保持し、静的な部分はオフスクリーンへ一度焼く。
 // 素の Canvas 2D と WebAudio だけで書く。論理画面は 960×540。
 (function () {
   'use strict';
@@ -45,17 +47,28 @@
   const WHIFF_MS = 380; // 伸びて消えるまで
   const WHIFF_OUT_MS = 90; // 伸び切るまで
   const WHIFF_GAP = 36; // だるまの足元からこれだけ手前で止まる
-  // 段の色。脆い段は明るい木（丸太の樹皮）の色を交互に（隣の段と見分けるため）、硬い段は暗い石の色。いずれも和風の落ち着いた色味
-  const FRAGILE_COLORS = ['#d9ad6c', '#cd9f5c'];
+  // 段の色。脆い段は明るい木（丸太の樹皮）、硬い段は暗い石の色。いずれも和風の落ち着いた色味
   const HARD_COLOR = '#575b63';
   const HARD_BAND = '#aaa49a'; // 硬い段の金属の帯
-  // 丸太の描き込み
-  const LOG_END_W = 64; // 両端の木口（切り口）が見える幅
-  const LOG_END_COLOR = '#ecd2a2'; // 木口の面（樹皮より少し明るい木の色）
-  const LOG_RING = 'rgba(112, 66, 26, 0.5)'; // 年輪の線
+  // 丸太（輪切り）の描き込み
+  const SEG_R = SEG_W / 2; // 丸太の半径（画面上の幅の半分）
+  const HORIZON_Y = 440; // 主観視点の水平線（drawBackground の壁と床の境と同じ高さ）。輪切りの縁の弧はここからの距離で膨らむ
+  const ARC_MAX = SEG_R * 0.35; // 縁の弧の膨らみの上限
+  const LOG_TEX_EXT = 112.5; // 模様を段の箱より上下に広く焼く分（弧がはみ出す上限 ARC_MAX ぶん。筋の刻み LOG_STEP で割り切れる値）
+  const LOG_STEP = 5; // 樹皮の筋を折れ線にする刻み（px）
+  const LOG_BASE_WARM = '#c89a62'; // 樹皮のベース色（赤み寄り）
+  const LOG_BASE_GRAY = '#b89770'; // 樹皮のベース色（灰み寄り）
+  const LOG_SHADE = '40, 22, 8'; // 陰影の暗
+  const LOG_LIGHT = '255, 240, 210'; // 陰影の明
   const LOG_BARK_DARK = '70, 40, 15'; // 樹皮の筋（濃）
   const LOG_BARK_LIGHT = '255, 236, 200'; // 樹皮の筋（淡）
-  const LOG_KNOT = '#6a4220'; // 節
+  const LOG_RING = 'rgba(112, 66, 26, 0.5)'; // 年輪の線（枝の切り株にだけ描く）
+  const LOG_STUMP_FACE = '#e9d3a6'; // 枝の切り株の木口（淡い木の色。暗い飛来物と逆の明るさに置く）
+  const LOG_EDGE_LIGHT = '#e2c796'; // 切り縁の帯（明）
+  const LOG_EDGE_DARK = '#6b4a2a'; // 切り縁の帯（暗）
+  const LOG_FACE = 'rgba(60, 36, 14, 0.85)'; // 落下中に覗く底面（影の中の木口）
+  const LOG_MOSS = '127, 138, 98'; // 苔
+  const CRACK_VERT_AVOID = (20 * Math.PI) / 180; // ヒビの枝が真縦からこの角度以内に入らないようにする（縦の樹皮の筋と紛れないため）
 
   // 戦闘開始の導入（塔が上から落ちてくる）
   const INTRO_HOLD_MS = 350; // 開始から塔が落ち始めるまで（台が空なのを見せる間）
@@ -335,8 +348,18 @@
     return { x: rx, y: ry, n, branches, chip };
   }
 
+  // 角度 a が真縦（上向き・下向き）の ±CRACK_VERT_AVOID に入っていたら、近い側の外へずらす。
+  // 樹皮の筋は縦に流れるので、ヒビの枝が縦に走ると見分けがつかなくなる
+  function tiltOffVertical(a, rng) {
+    const d = ((((a - Math.PI / 2) % Math.PI) + Math.PI * 1.5) % Math.PI) - Math.PI / 2; // 縦からのずれ（-π/2〜π/2）
+    if (Math.abs(d) >= CRACK_VERT_AVOID) return a;
+    const s = d !== 0 ? Math.sign(d) : rng() < 0.5 ? -1 : 1;
+    return a + s * (CRACK_VERT_AVOID - Math.abs(d));
+  }
+
   // 段のヒビ。段の番号と何打目かから決定的に作る（段の中心を原点にした座標）。
-  // 巨大な段（620×500）の全面に散らし、枝の長さは SEG_CRACK_SCALE で広げる（100〜250px ほど）。少し横に走りやすくする
+  // 巨大な段（620×500）の全面に散らし、枝の長さは SEG_CRACK_SCALE で広げる（100〜250px ほど）。少し横に走りやすくし、
+  // さらに枝の向きを真縦 ±20° から外す（縦の樹皮の筋と重ならないように）
   function generateSegCrack(segId, n) {
     const rng = mulberry32(hash3(segId, n, 101));
     const x = (rng() - 0.5) * (SEG_W - 180);
@@ -352,7 +375,7 @@
       let cy = 0;
       const pts = [];
       for (let s = 0; s < segs; s++) {
-        a += (rng() - 0.5) * 1.1;
+        a = tiltOffVertical(a + (rng() - 0.5) * 1.1, rng);
         const step = (total / segs) * (0.7 + 0.6 * rng());
         cx += Math.cos(a) * step;
         cy += Math.sin(a) * step * 0.8;
@@ -363,72 +386,173 @@
     return { x, y, n, branches };
   }
 
-  // 丸太の模様。段の生成時にシードから一度だけ作って段に持たせる（戦闘中の再描画で模様が変わらないように）。
-  // 段の中心を原点にした座標。樹皮の筋・裂け目・節は両端の木口（LOG_END_W）を避けた範囲に置く
+  // 丸太（輪切り）の模様。段の生成時にシードから一度だけ作って段に持たせる（戦闘中の再描画で模様が変わらないように）。
+  // 段の中心を原点にした座標。模様は段の箱より上下に LOG_TEX_EXT だけ広く作る（上下の縁の弧がはみ出す分を埋めるため）。
+  // 静的な部分は barkTexture() でオフスクリーンへ一度焼いて pat.tex に持つ
   function makeLogPattern(seed) {
     const rng = mulberry32(seed);
-    const w = SEG_W;
+    const R = SEG_R;
     const h = SEG_H;
-    const x0 = -w / 2 + LOG_END_W + 12;
-    const x1 = w / 2 - LOG_END_W - 12;
-    // 樹皮の筋：長さ方向に流れ、ところどころ途切れる。濃い筋と淡い筋を混ぜる
-    const streaks = [];
-    const ns = 22 + Math.floor(rng() * 8);
-    for (let i = 0; i < ns; i++) {
-      const light = rng() < 0.3;
-      const dashes = [];
-      let x = x0 + rng() * 70;
-      while (x < x1 - 30) {
-        const xe = Math.min(x1, x + 60 + rng() * 180);
-        dashes.push({ x0: x, x1: xe, dy: (rng() - 0.5) * 10, bend: (rng() - 0.5) * 16 });
-        x = xe + 16 + rng() * 60;
-      }
-      streaks.push({
-        y: -h / 2 + 26 + rng() * (h - 52),
-        width: light ? 1.5 + rng() * 2 : 2 + rng() * 3.5,
-        alpha: light ? 0.12 + rng() * 0.14 : 0.14 + rng() * 0.18,
-        light,
-        dashes,
-      });
-    }
-    // 樹皮の裂け目：短い、ほぼ横向きの細い裂け
-    const splits = [];
-    const nsp = 6 + Math.floor(rng() * 5);
-    for (let i = 0; i < nsp; i++) {
-      splits.push({
-        x: x0 + 24 + rng() * (x1 - x0 - 48),
-        y: -h / 2 + 40 + rng() * (h - 80),
-        len: 28 + rng() * 48,
-        a: (rng() - 0.5) * 0.4,
-        w: 4 + rng() * 5,
-      });
-    }
-    // 節：渦のある濃い点。1〜3 個、互いに離して置く
-    const knots = [];
+    const y0 = -h / 2 - LOG_TEX_EXT;
+    const y1 = h / 2 + LOG_TEX_EXT;
+    const pick = (a, b) => a + rng() * (b - a);
+    const pat = {
+      base: rng() < 0.5 ? LOG_BASE_WARM : LOG_BASE_GRAY, // ベース色相（A 赤み寄り / B 灰み寄り）
+      lightShift: (rng() - 0.5) * 0.06, // 光の帯の位置の揺れ（幅に対する割合、±3%）。光の向きそのものは全段で固定
+      blotches: [], // 低周波の色むら（柔らかい縦帯）
+      knots: [], // 節（生きた節 = 縦長のアーモンド、枝の切り株 = 円。筋はこの周りを迂回する）
+      streaks: [], // 樹皮の主筋（縦の波線。途切れ・合流つき。runs に折れ線の区間を持つ）
+      subs: [], // 副筋
+      peels: [], // 剥がれ（樹皮が浮いた帯）
+      chips: [], // 切り縁から垂れる欠け
+      moss: [], // 苔
+      stippleSeed: Math.floor(rng() * 1e9), // 点描の乱数の種
+      faceOff: (rng() - 0.5) * 0.3, // 落下中に覗く底面の年輪の芯のずれ（半径に対する割合）
+      faceRings: [], // 底面の年輪（半径に対する割合）
+      tex: null, // 焼いた模様
+      texK: 0, // 焼いたときの解像度
+    };
+    // 低周波の色むら
+    const nb = 3 + Math.floor(rng() * 3);
+    for (let i = 0; i < nb; i++) pat.blotches.push({ x: pick(-R, R), w: pick(90, 160), dark: rng() < 0.5, alpha: pick(0.05, 0.08) });
+    // 節。1〜3 個、互いに離して置く。枝の切り株は 1 段に最大 1 個、出現確率 5 割
     const nk = 1 + Math.floor(rng() * 3);
+    const stumpAt = rng() < 0.5 ? Math.floor(rng() * nk) : -1;
     for (let i = 0; i < nk; i++) {
-      let k = null;
-      for (let tries = 0; tries < 8; tries++) {
-        const c = { x: x0 + 50 + rng() * (x1 - x0 - 100), y: -h / 2 + 70 + rng() * (h - 140) };
-        if (knots.every((o) => Math.hypot(o.x - c.x, o.y - c.y) > 150)) {
-          k = c;
+      let c = null;
+      for (let tries = 0; tries < 10; tries++) {
+        const cand = { x: pick(-R + 80, R - 80), y: pick(-h / 2 + 90, h / 2 - 90) };
+        if (pat.knots.every((o) => Math.hypot(o.x - cand.x, o.y - cand.y) > 150)) {
+          c = cand;
           break;
         }
-        k = k || c;
+        c = c || cand;
       }
-      knots.push({ x: k.x, y: k.y, rx: 20 + rng() * 16, ry: 12 + rng() * 10, rot: (rng() - 0.5) * 0.5, rings: 2 + Math.floor(rng() * 2) });
+      if (i === stumpAt) {
+        const r = pick(22, 40);
+        const rings = [];
+        let f = 0.14;
+        while (f < 0.86 && rings.length < 7) {
+          rings.push(f);
+          f += pick(0.09, 0.16);
+        }
+        // ax/ay = 筋を迂回させる範囲（半径の 1.8 倍）
+        pat.knots.push({ kind: 'stump', x: c.x, y: c.y, r, rings, pcx: pick(-0.25, 0.25), pcy: pick(-0.25, 0.25), ax: 1.8 * r, ay: 1.8 * r });
+      } else {
+        const w = pick(24, 40);
+        const hgt = w * pick(2.2, 2.6);
+        pat.knots.push({ kind: 'live', x: c.x, y: c.y, w, hgt, rings: 2 + Math.floor(rng() * 2), tilt: (rng() - 0.5) * 0.24, ax: 0.9 * w, ay: 0.9 * hgt });
+      }
     }
-    // 木口：年輪の間隔（芯からの割合）と芯の位置。左右で別に作る
-    const ends = [0, 1].map(() => {
-      const rings = [];
-      let r = 0.12 + rng() * 0.08;
-      while (r < 1.05) {
-        rings.push(r);
-        r += 0.08 + rng() * 0.1;
+    // 節の周りで筋を横に迂回させる（石を避ける水の流れ）。xBase は筋の素の位置（どちら側へ逃げるかを決める）
+    const deflect = (x, y, xBase) => {
+      let out = x;
+      for (const k of pat.knots) {
+        const d = Math.hypot((x - k.x) / k.ax, (y - k.y) / k.ay);
+        if (d >= 1) continue;
+        out += (xBase >= k.x ? 1 : -1) * (1 - d) * k.ax;
       }
-      return { rings, cx: 0.3 + rng() * 0.15, cy: (rng() - 0.5) * 0.3 };
-    });
-    return { streaks, splits, knots, ends };
+      return out;
+    };
+    const wave = (s, y) => s.x + s.amp * Math.sin((TAU * y) / s.wl + s.ph) + s.amp2 * Math.sin((TAU * y) / s.wl2 + s.ph2);
+    // 主筋：間隔 30〜45px を揺らして等間隔にしない。1 本は全高を走る波線
+    let sx = -R + pick(14, 40);
+    while (sx < R - 14) {
+      pat.streaks.push({
+        x: sx,
+        amp: pick(6, 10),
+        wl: pick(120, 200),
+        ph: rng() * TAU,
+        amp2: pick(1, 2.5),
+        wl2: pick(40, 70),
+        ph2: rng() * TAU,
+        width: pick(3, 5),
+        alpha: pick(0.22, 0.3),
+        gaps: [],
+        pts: [],
+        runs: [],
+      });
+      sx += pick(30, 45);
+    }
+    for (const s of pat.streaks) {
+      const ng = 1 + Math.floor(rng() * 3);
+      for (let g = 0; g < ng; g++) s.gaps.push({ y: pick(-h / 2 + 30, h / 2 - 80), len: pick(20, 50) });
+      for (let y = y0; y <= y1 + 0.01; y += LOG_STEP) s.pts.push({ x: deflect(wave(s, y), y, s.x), y });
+    }
+    // 合流（Y 字）：隣の 2 本が 60〜100px の区間で寄って 1 本になる。合流した側の筋はそこで終わる
+    const nm = 4 + Math.floor(rng() * 3);
+    const used = new Set();
+    for (let m = 0; m < nm && pat.streaks.length > 1; m++) {
+      const j = 1 + Math.floor(rng() * (pat.streaks.length - 1));
+      const L = pick(60, 100);
+      const ys = pick(-h / 2 + 40, h / 2 - 40 - L);
+      const down = rng() < 0.5;
+      if (used.has(j) || used.has(j - 1)) continue;
+      used.add(j);
+      used.add(j - 1);
+      const src = pat.streaks[j];
+      const dst = pat.streaks[j - 1];
+      const kept = [];
+      for (let i = 0; i < src.pts.length; i++) {
+        const p = src.pts[i];
+        const q = dst.pts[i];
+        const t = down ? (p.y - ys) / L : (ys + L - p.y) / L;
+        if (t > 1) continue;
+        const f = t <= 0 ? 0 : t * t * (3 - 2 * t);
+        kept.push({ x: lerp(p.x, q.x, f), y: p.y });
+      }
+      src.pts = kept;
+    }
+    // 途切れで区間に分ける。筋そのものの両端（模様の端、または合流の先）は yMin / yMax に残し、描くときにそこでは細らせない
+    for (const s of pat.streaks) {
+      s.yMin = s.pts.length ? s.pts[0].y : y0;
+      s.yMax = s.pts.length ? s.pts[s.pts.length - 1].y : y1;
+      let cur = [];
+      for (const p of s.pts) {
+        if (s.gaps.some((g) => p.y >= g.y && p.y <= g.y + g.len)) {
+          if (cur.length > 1) s.runs.push(cur);
+          cur = [];
+        } else cur.push(p);
+      }
+      if (cur.length > 1) s.runs.push(cur);
+      s.pts = null;
+    }
+    // 副筋：主筋の間を埋める細い波線。長さは全高の 30〜70%。暗 7 割・明 3 割
+    const nsub = 25 + Math.floor(rng() * 11);
+    for (let i = 0; i < nsub; i++) {
+      const len = h * pick(0.3, 0.7);
+      const ya = pick(y0, y1 - len);
+      const s = {
+        x: pick(-R + 10, R - 10),
+        amp: pick(4, 8),
+        wl: pick(100, 180),
+        ph: rng() * TAU,
+        amp2: pick(0.5, 1.5),
+        wl2: pick(40, 70),
+        ph2: rng() * TAU,
+        width: pick(1, 2),
+        alpha: pick(0.1, 0.16),
+        light: rng() < 0.3,
+        pts: [],
+      };
+      for (let y = ya; y <= ya + len; y += LOG_STEP) s.pts.push({ x: deflect(wave(s, y), y, s.x), y });
+      pat.subs.push(s);
+    }
+    // 剥がれ：0〜3 本
+    const np = Math.floor(rng() * 4);
+    for (let i = 0; i < np; i++) pat.peels.push({ x: pick(-R + 40, R - 40), y: pick(-h / 2 + 100, h / 2 - 100), w: pick(10, 18), h: pick(80, 160), tip: pick(14, 24) });
+    // 切り縁の欠け：3〜6 個を上下の縁に振り分ける
+    const nc = 3 + Math.floor(rng() * 4);
+    for (let i = 0; i < nc; i++) pat.chips.push({ top: rng() < 0.5, x: pick(-R + 40, R - 40), w: pick(10, 20), d: pick(5, 10) });
+    // 苔：下 3 分の 1 に 0〜3 個
+    if (rng() < 0.65) {
+      const nmoss = 1 + Math.floor(rng() * 3);
+      for (let i = 0; i < nmoss; i++) pat.moss.push({ x: pick(-R + 60, R - 60), y: pick(h / 2 - h / 3 + 20, h / 2 - 16), rx: pick(28, 60), ry: pick(12, 24), alpha: pick(0.1, 0.15) });
+    }
+    // 底面の年輪：3〜4 本
+    const nf = 3 + Math.floor(rng() * 2);
+    for (let i = 0; i < nf; i++) pat.faceRings.push(((i + 1) / (nf + 1)) * 0.9 * pick(0.95, 1.05));
+    return pat;
   }
 
   const enemyView = makeDarumaView(DARUMA_W);
@@ -700,6 +824,7 @@
   let fireworkTimer = 0;
   let fireworksLeft = 0;
   let lastLandSound = -1000;
+  let viewK = 1; // 描画の解像度（キャンバスの実画素 / 論理画素）。段の模様をオフスクリーンへ焼くときの倍率に使う
 
   // ---- 塔の幾何（論理位置。落下中の見た目のずれは dispDy で別に持つ） ----
   function segTop(i) {
@@ -792,14 +917,15 @@
     for (let i = 0; i < SEGMENT_COUNT; i++) {
       const kind = LEVEL_KINDS[i];
       const maxHp = kind === 'hard' ? SEG_HP_HARD : SEG_HP_FRAGILE;
+      const pattern = kind === 'hard' ? null : makeLogPattern(hash3(battleNo, i + 1, 977));
       segments.push({
         id: i + 1,
         kind,
         hp: maxHp,
         maxHp,
         hits: 0,
-        color: kind === 'hard' ? HARD_COLOR : FRAGILE_COLORS[i % FRAGILE_COLORS.length],
-        pattern: kind === 'hard' ? null : makeLogPattern(hash3(battleNo, i + 1, 977)),
+        color: kind === 'hard' ? HARD_COLOR : pattern.base, // 脆い段の色は模様のベース色相（破片の色にも使う）
+        pattern,
         cracks: [],
         jolt: 0,
         dispDy: -SEG_H,
@@ -1586,144 +1712,407 @@
     ctx.moveTo(x0 + 14, TABLE_Y + 14);
     ctx.lineTo(x0 + TABLE_W - 14, TABLE_Y + 14);
     ctx.stroke();
-    // 塔の影（天板の上）。一番下の段がまだ落ちてくる途中なら、近づくにつれて影が広がる（導入で「上から来る」合図になる）
+    // 塔の影（天板の上）。一番下の段がまだ落ちてくる途中なら、近づくにつれて影が広がる（導入で「上から来る」合図になる）。
+    // 段の幅に合わせて少し広く、接地の ∪ の弧（中央で約 10px 下がる）の周りに覗く厚みにする
     if (phase !== 'title') {
-      let sw = segments.length ? SEG_W * 0.5 : DARUMA_W * 0.5;
+      let sw = segments.length ? SEG_W * 0.56 : DARUMA_W * 0.5;
       if (segments.length && segments[0].dispDy < 0) sw *= clamp(1 + segments[0].dispDy / SEG_H, 0.3, 1);
       ctx.fillStyle = 'rgba(42, 37, 34, 0.22)';
       ctx.beginPath();
-      ctx.ellipse(CENTER_X, TABLE_Y + 1, sw, 6, 0, 0, TAU);
+      ctx.ellipse(CENTER_X, TABLE_Y + 2, sw, segments.length ? 9 : 6, 0, 0, TAU);
       ctx.fill();
     }
     ctx.restore();
   }
 
-  // 脆い段＝横倒しの巨大な丸太の描き込み（段の中心を原点、roundRect の clip の中で呼ぶ）。
-  // 円柱の陰影 → 樹皮の筋・裂け目 → 節 → 両端の木口と年輪。模様は seg.pattern（生成時に決めたもの）
-  function drawLogBody(ctx, seg) {
+  // ---- 丸太（輪切り）の幾何 ----
+  // 高さ y にある輪切りの縁（円）の見かけの膨らみ。正 = 上に膨らむ ∩（水平線より上の円を見上げる）、負 = 下に膨らむ ∪（水平線より下）。
+  // 膨らみ = 水平線からの距離 ÷ 1000 × 半径、上限は半径の 0.35 倍。静止時の下端（y=470）で約 10px、落下開始時（下端 y≈0）で約 108px
+  function arcBulge(y) {
+    return clamp(((HORIZON_Y - y) / 1000) * SEG_R, -ARC_MAX, ARC_MAX);
+  }
+  // 縁の弧の、x の位置での y（弧の両端は y、中央は y - bulge）
+  function arcY(x, y, bulge) {
+    const u = clamp(x / SEG_R, -1, 1);
+    return y - bulge * Math.sqrt(1 - u * u);
+  }
+  // 現在のパス位置（弧の端）から、高さ y の縁の弧を反対の端まで辿る（楕円の半分）
+  function traceArc(ctx, y, bulge, leftToRight) {
+    const ry = Math.max(0.01, Math.abs(bulge));
+    const up = bulge >= 0;
+    if (leftToRight) ctx.ellipse(0, y, SEG_R, ry, 0, Math.PI, up ? TAU : 0, !up);
+    else ctx.ellipse(0, y, SEG_R, ry, 0, 0, up ? -Math.PI : Math.PI, up);
+  }
+  // 段の側面の輪郭（中心を原点）。左右は垂直、上端と下端は縁の弧。角丸は使わない（円柱の縁と側面が出合う角は鋭い）
+  function segOutline(ctx, bt, bb) {
+    ctx.beginPath();
+    ctx.moveTo(-SEG_R, -SEG_H / 2);
+    traceArc(ctx, -SEG_H / 2, bt, true);
+    ctx.lineTo(SEG_R, SEG_H / 2);
+    traceArc(ctx, SEG_H / 2, bb, false);
+    ctx.closePath();
+  }
+  function edgeArcPath(ctx, y, bulge) {
+    ctx.beginPath();
+    ctx.moveTo(-SEG_R, y);
+    traceArc(ctx, y, bulge, true);
+  }
+
+  // 中心線 pts（y が単調増加の折れ線）に沿って幅 2×halfW の帯を塗る。taperStart / taperEnd の端は 18px かけて細く消える
+  function fillRibbon(ctx, pts, halfW, taperStart, taperEnd) {
+    const n = pts.length;
+    if (n < 2) return;
+    const taper = 18;
+    const ya = pts[0].y;
+    const yb = pts[n - 1].y;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const p = pts[i];
+      let f = 1;
+      if (taperStart) f = Math.min(f, (p.y - ya) / taper);
+      if (taperEnd) f = Math.min(f, (yb - p.y) / taper);
+      const hw = halfW * Math.max(0.05, Math.min(1, f));
+      if (i === 0) ctx.moveTo(p.x - hw, p.y);
+      else ctx.lineTo(p.x - hw, p.y);
+    }
+    for (let i = n - 1; i >= 0; i--) {
+      const p = pts[i];
+      let f = 1;
+      if (taperStart) f = Math.min(f, (p.y - ya) / taper);
+      if (taperEnd) f = Math.min(f, (yb - p.y) / taper);
+      const hw = halfW * Math.max(0.05, Math.min(1, f));
+      ctx.lineTo(p.x + hw, p.y);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // 樹皮の静的な模様を描く（段の中心を原点。範囲は x ∈ [-SEG_R, SEG_R]、y ∈ [-SEG_H/2 - LOG_TEX_EXT, SEG_H/2 + LOG_TEX_EXT]）。
+  // 順番：ベース → 色むら → 左右の円柱陰影 → 副筋 → 主筋 → 剥がれ → 節 → 苔 → 点描。年輪は側面には描かない（枝の切り株だけ）
+  function drawBarkTexture(ctx, pat) {
+    const R = SEG_R;
     const w = SEG_W;
     const h = SEG_H;
-    const pat = seg.pattern || makeLogPattern(hash3(seg.id || 0, 0, 977)); // 保険（通常は生成時のものを使う）
-    // 円柱の陰影：上端と下端が暗く、中央より少し上に光の帯
-    const grad = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
-    grad.addColorStop(0, 'rgba(40, 22, 8, 0.44)');
-    grad.addColorStop(0.16, 'rgba(40, 22, 8, 0.14)');
-    grad.addColorStop(0.36, 'rgba(255, 240, 210, 0.2)');
-    grad.addColorStop(0.5, 'rgba(255, 240, 210, 0.08)');
-    grad.addColorStop(0.72, 'rgba(40, 22, 8, 0.1)');
-    grad.addColorStop(1, 'rgba(40, 22, 8, 0.48)');
-    ctx.fillStyle = grad;
-    ctx.fillRect(-w / 2, -h / 2, w, h);
-    // 樹皮の筋（長さ方向。途切れながら流れる）
-    ctx.lineCap = 'round';
-    for (const st of pat.streaks) {
-      ctx.strokeStyle = `rgba(${st.light ? LOG_BARK_LIGHT : LOG_BARK_DARK}, ${st.alpha})`;
-      ctx.lineWidth = st.width;
-      ctx.beginPath();
-      for (const d of st.dashes) {
-        ctx.moveTo(d.x0, st.y);
-        ctx.quadraticCurveTo((d.x0 + d.x1) / 2, st.y + d.bend, d.x1, st.y + d.dy);
-      }
-      ctx.stroke();
+    const y0 = -h / 2 - LOG_TEX_EXT;
+    const th = h + 2 * LOG_TEX_EXT;
+    ctx.fillStyle = pat.base;
+    ctx.fillRect(-R, y0, w, th);
+    // 低周波の色むら：輪郭をぼかした柔らかい縦帯
+    for (const b of pat.blotches) {
+      const g = ctx.createLinearGradient(b.x - b.w / 2, 0, b.x + b.w / 2, 0);
+      const c = b.dark ? LOG_SHADE : LOG_LIGHT;
+      g.addColorStop(0, `rgba(${c}, 0)`);
+      g.addColorStop(0.5, `rgba(${c}, ${b.alpha})`);
+      g.addColorStop(1, `rgba(${c}, 0)`);
+      ctx.fillStyle = g;
+      ctx.fillRect(b.x - b.w / 2, y0, b.w, th);
     }
-    // 樹皮の裂け目：細い木の葉形。下側に淡い縁を添えて凹みに見せる
-    for (const sp of pat.splits) {
-      ctx.save();
-      ctx.translate(sp.x, sp.y);
-      ctx.rotate(sp.a);
-      ctx.fillStyle = 'rgba(50, 28, 10, 0.55)';
+    // 円柱の陰影（左右方向）。光の帯は中央より少し左（光は左上前）。右をより暗く。段ごとに帯の位置を ±3% 揺らす
+    const sh = pat.lightShift;
+    const grad = ctx.createLinearGradient(-R, 0, R, 0);
+    const stop = (f, c, a) => grad.addColorStop(clamp(f + 0.5 + sh, 0, 1), `rgba(${c}, ${a})`);
+    grad.addColorStop(0, `rgba(${LOG_SHADE}, 0.42)`);
+    stop(-0.3, LOG_SHADE, 0.12);
+    stop(-0.12, LOG_LIGHT, 0.18);
+    stop(0.05, LOG_LIGHT, 0.06);
+    stop(0.3, LOG_SHADE, 0.12);
+    stop(0.42, LOG_SHADE, 0.3);
+    grad.addColorStop(1, `rgba(${LOG_SHADE}, 0.5)`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(-R, y0, w, th);
+    // 副筋
+    for (const s of pat.subs) {
+      ctx.fillStyle = `rgba(${s.light ? LOG_BARK_LIGHT : LOG_BARK_DARK}, ${s.alpha})`;
+      fillRibbon(ctx, s.pts, s.width / 2, true, true);
+    }
+    // 主筋：溝として読ませるため、筋の左側に細い明線を添える。途切れの端だけ細く消し、筋そのものの端（模様の端＝縁の弧で切り落とす、合流の先）は細らせない
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (const s of pat.streaks) {
+      for (const run of s.runs) {
+        const taperStart = run[0].y > s.yMin + 1;
+        const taperEnd = run[run.length - 1].y < s.yMax - 1;
+        ctx.fillStyle = `rgba(${LOG_BARK_DARK}, ${s.alpha})`;
+        fillRibbon(ctx, run, s.width / 2, taperStart, taperEnd);
+        ctx.strokeStyle = `rgba(${LOG_BARK_LIGHT}, 0.18)`;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        for (let i = 0; i < run.length; i++) {
+          const p = run[i];
+          if (i === 0) ctx.moveTo(p.x - s.width / 2 - 0.8, p.y);
+          else ctx.lineTo(p.x - s.width / 2 - 0.8, p.y);
+        }
+        ctx.stroke();
+      }
+    }
+    // 剥がれ：少し明るい縦帯。右側に暗い影線、上下の端は細く割れて尖る
+    for (const p of pat.peels) {
+      const xa = p.x - p.w / 2;
+      const xb = p.x + p.w / 2;
+      const ya = p.y - p.h / 2;
+      const yb = p.y + p.h / 2;
+      ctx.fillStyle = `rgba(${LOG_LIGHT}, 0.12)`;
       ctx.beginPath();
-      ctx.moveTo(-sp.len / 2, 0);
-      ctx.quadraticCurveTo(0, -sp.w, sp.len / 2, 0);
-      ctx.quadraticCurveTo(0, sp.w, -sp.len / 2, 0);
+      ctx.moveTo(xa, ya + p.tip);
+      ctx.lineTo(xa + p.w * 0.35, ya);
+      ctx.lineTo(xb, ya + p.tip * 1.3);
+      ctx.lineTo(xb, yb - p.tip * 0.7);
+      ctx.lineTo(xb - p.w * 0.4, yb);
+      ctx.lineTo(xa, yb - p.tip);
       ctx.closePath();
       ctx.fill();
-      ctx.strokeStyle = `rgba(${LOG_BARK_LIGHT}, 0.3)`;
-      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = `rgba(${LOG_SHADE}, 0.4)`;
+      ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.moveTo(-sp.len / 2, 1.5);
-      ctx.quadraticCurveTo(0, sp.w + 1.5, sp.len / 2, 1.5);
+      ctx.moveTo(xb, ya + p.tip * 1.3);
+      ctx.lineTo(xb, yb - p.tip * 0.7);
+      ctx.lineTo(xb - p.w * 0.4, yb);
       ctx.stroke();
-      ctx.restore();
     }
-    // 節：濃い楕円に渦の輪
+    // 節
     for (const k of pat.knots) {
       ctx.save();
       ctx.translate(k.x, k.y);
-      ctx.rotate(k.rot);
-      ctx.fillStyle = 'rgba(60, 36, 14, 0.25)'; // 節のまわりの淡いにじみ
-      ctx.beginPath();
-      ctx.ellipse(0, 0, k.rx * 1.5, k.ry * 1.45, 0, 0, TAU);
-      ctx.fill();
-      ctx.fillStyle = LOG_KNOT;
-      ctx.beginPath();
-      ctx.ellipse(0, 0, k.rx, k.ry, 0, 0, TAU);
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(230, 200, 150, 0.5)';
-      ctx.lineWidth = 1.8;
-      for (let i = 1; i <= k.rings; i++) {
-        const f = i / (k.rings + 1);
+      if (k.kind === 'stump') {
+        // 枝の切り株：縁に薄い樹皮の輪、中は淡い木口に芯をずらした年輪。突き出ているので右下に影の三日月、左上に光の縁
+        ctx.fillStyle = 'rgba(90, 55, 25, 0.55)';
         ctx.beginPath();
-        ctx.ellipse(k.rx * 0.12 * i, 0, k.rx * f, k.ry * f, 0, 0, TAU);
+        ctx.arc(0, 0, k.r, 0, TAU);
+        ctx.fill();
+        ctx.fillStyle = LOG_STUMP_FACE;
+        ctx.beginPath();
+        ctx.arc(0, 0, k.r * 0.82, 0, TAU);
+        ctx.fill();
+        const cx = k.pcx * k.r;
+        const cy = k.pcy * k.r;
+        ctx.strokeStyle = LOG_RING;
+        ctx.lineWidth = 1.6;
+        for (const f of k.rings) {
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, f * k.r * 0.82 * (1 - Math.abs(k.pcx)), f * k.r * 0.82 * (1 - Math.abs(k.pcy)), 0, 0, TAU);
+          ctx.stroke();
+        }
+        ctx.fillStyle = 'rgba(112, 66, 26, 0.7)';
+        ctx.beginPath();
+        ctx.arc(cx, cy, 2.5, 0, TAU);
+        ctx.fill();
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(0, 0, k.r, 0, TAU);
+        ctx.clip();
+        ctx.fillStyle = `rgba(${LOG_SHADE}, 0.3)`;
+        ctx.beginPath();
+        ctx.arc(0, 0, k.r, 0, TAU);
+        ctx.arc(-0.26 * k.r, -0.26 * k.r, k.r, 0, TAU);
+        ctx.fill('evenodd');
+        ctx.restore();
+        ctx.strokeStyle = `rgba(${LOG_LIGHT}, 0.35)`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(0, 0, k.r - 1, Math.PI * 1.0, Math.PI * 1.7);
         ctx.stroke();
+        ctx.strokeStyle = 'rgba(42, 37, 34, 0.5)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(0, 0, k.r, 0, TAU);
+        ctx.stroke();
+      } else {
+        // 生きた節：縦長のアーモンド形（飛来物と見分けるため円くしない。暗部は幅 26px 以下・alpha 0.5 以下）
+        ctx.rotate(k.tilt);
+        const almond = (hw, hh) => {
+          ctx.beginPath();
+          ctx.moveTo(0, -hh);
+          ctx.quadraticCurveTo(2 * hw, 0, 0, hh);
+          ctx.quadraticCurveTo(-2 * hw, 0, 0, -hh);
+          ctx.closePath();
+        };
+        ctx.fillStyle = 'rgba(60, 36, 14, 0.2)'; // 周囲の淡いにじみ
+        almond(k.w * 0.5 * 1.35, k.hgt * 0.5 * 1.25);
+        ctx.fill();
+        const cw = Math.min(k.w * 0.62, 26);
+        ctx.fillStyle = 'rgba(50, 30, 12, 0.48)';
+        almond(cw / 2, k.hgt * 0.5 * 0.9);
+        ctx.fill();
+        // 同心の輪
+        ctx.lineWidth = 1.6;
+        for (let i = 1; i <= k.rings; i++) {
+          const f = 0.45 + (0.55 * i) / k.rings;
+          ctx.strokeStyle = i % 2 ? 'rgba(230, 200, 150, 0.42)' : 'rgba(50, 30, 12, 0.3)';
+          almond((k.w / 2) * f, (k.hgt / 2) * f);
+          ctx.stroke();
+        }
+        // 中心の暗い芽
+        ctx.fillStyle = 'rgba(36, 22, 10, 0.85)';
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 3, 7, 0, 0, TAU);
+        ctx.fill();
       }
-      ctx.fillStyle = 'rgba(36, 22, 10, 0.9)';
-      ctx.beginPath();
-      ctx.ellipse(k.rx * 0.1, 0, k.rx * 0.18, k.ry * 0.18, 0, 0, TAU);
-      ctx.fill();
       ctx.restore();
     }
-    // 木口：両端に切り口の面（D 形。縁が平らで内側へ膨らむ）を少し明るい木の色で描き、同心円の年輪を乗せる
-    for (let side = 0; side < 2; side++) {
-      const sgn = side === 0 ? -1 : 1;
-      const edgeX = sgn * (w / 2);
-      const end = pat.ends[side];
-      ctx.save();
+    // 苔
+    for (const m of pat.moss) {
+      ctx.fillStyle = `rgba(${LOG_MOSS}, ${m.alpha})`;
       ctx.beginPath();
-      // 端を中心にした楕円の内側半分（左端なら右半分）＝切り口の見える面
-      if (sgn < 0) ctx.ellipse(edgeX, 0, LOG_END_W, h / 2, 0, -Math.PI / 2, Math.PI / 2);
-      else ctx.ellipse(edgeX, 0, LOG_END_W, h / 2, 0, Math.PI / 2, (3 * Math.PI) / 2);
-      ctx.closePath();
-      ctx.fillStyle = LOG_END_COLOR;
+      ctx.ellipse(m.x, m.y, m.rx, m.ry, 0, 0, TAU);
       ctx.fill();
-      ctx.clip();
-      // 木口にも円柱の陰影を薄く
-      ctx.fillStyle = grad;
-      ctx.globalAlpha = 0.45;
-      ctx.fillRect(-w / 2, -h / 2, w, h);
-      ctx.globalAlpha = 1;
-      // 年輪：芯（面の中ほど）を中心にした同心の楕円。面の外は clip で切れる
-      const cx = edgeX - sgn * LOG_END_W * end.cx;
-      const cy = end.cy * (h / 2);
-      ctx.strokeStyle = LOG_RING;
-      ctx.lineCap = 'butt';
-      for (let i = 0; i < end.rings.length; i++) {
-        const r = end.rings[i];
-        ctx.lineWidth = i % 3 === 0 ? 2.8 : 1.8;
-        ctx.beginPath();
-        ctx.ellipse(cx, cy, r * LOG_END_W * 1.15, r * (h / 2) * 1.05, 0, 0, TAU);
-        ctx.stroke();
-      }
-      ctx.fillStyle = 'rgba(112, 66, 26, 0.7)';
-      ctx.beginPath();
-      ctx.ellipse(cx, cy, 5, 7, 0, 0, TAU);
-      ctx.fill();
-      ctx.restore();
-      // 面の縁（樹皮との境）
-      ctx.strokeStyle = 'rgba(42, 37, 34, 0.6)';
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      if (sgn < 0) ctx.ellipse(edgeX, 0, LOG_END_W, h / 2, 0, -Math.PI / 2, Math.PI / 2);
-      else ctx.ellipse(edgeX, 0, LOG_END_W, h / 2, 0, Math.PI / 2, (3 * Math.PI) / 2);
-      ctx.stroke();
+    }
+    // 点描（ざらつき）：暗・明半々
+    const srng = mulberry32(pat.stippleSeed);
+    const n = 480 + Math.floor(srng() * 60);
+    for (let i = 0; i < n; i++) {
+      const x = -R + srng() * w;
+      const y = y0 + srng() * th;
+      ctx.fillStyle = srng() < 0.5 ? `rgba(${LOG_SHADE}, 0.07)` : `rgba(${LOG_LIGHT}, 0.07)`;
+      ctx.fillRect(x, y, 1.5, 1.5);
     }
   }
 
-  // 段の本体。中心を原点に描く。seg は { kind, color, pattern, cracks, hits, maxHp } を持つ
-  function drawSegmentBody(ctx, seg) {
+  // 模様を焼いたオフスクリーン canvas を返す（解像度が変わったら焼き直す）。毎フレーム描くのはこのビットマップと縁・影・ヒビだけ
+  function barkTexture(pat) {
+    const k = Math.min(viewK, 3);
+    if (pat.tex && pat.texK === k) return pat.tex;
+    const c = pat.tex || document.createElement('canvas');
+    const w = SEG_W;
+    const th = SEG_H + 2 * LOG_TEX_EXT;
+    c.width = Math.max(1, Math.ceil(w * k));
+    c.height = Math.max(1, Math.ceil(th * k));
+    const tctx = c.getContext('2d');
+    tctx.setTransform(k, 0, 0, k, (w / 2) * k, (th / 2) * k);
+    drawBarkTexture(tctx, pat);
+    pat.tex = c;
+    pat.texK = k;
+    return c;
+  }
+
+  // 段のヒビ（段の中心を原点、clip の中で呼ぶ）。段階：0 = 薄い、1 = 中、2 = 大（打数の割合で決まる）。
+  // 巨大な段の全面で読めるよう太く長く描く。樹皮の筋（幅 5 以下・alpha 0.3 以下・滑らかな縦）と紛れないよう、ヒビは太く濃く角張ったまま。
+  // yTop / hh は段階 1 以上で全体を暗くする範囲（輪郭のはみ出しも覆う）
+  function drawSegCracks(ctx, seg, yTop, hh) {
+    if (!seg.cracks.length) return;
+    const w = SEG_W;
+    const stage = stageOf(Math.min(seg.hits, seg.maxHp - 1), seg.maxHp);
+    const lenMul = [0.45, 0.8, 1.2][stage];
+    const lw = [3.5, 5.5, 8][stage];
+    const alpha = [0.55, 0.9, 1][stage];
+    const off = lw * 0.3; // 明るい線の添え方（割れ目の片側）
+    if (stage >= 1) {
+      ctx.fillStyle = `rgba(0, 0, 0, ${0.07 * stage})`;
+      ctx.fillRect(-w / 2, yTop, w, hh);
+    }
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (const cr of seg.cracks) {
+      for (const br of cr.branches) {
+        ctx.beginPath();
+        ctx.moveTo(cr.x, cr.y);
+        for (const p of br) ctx.lineTo(cr.x + p.x * lenMul, cr.y + p.y * lenMul);
+        ctx.strokeStyle = `rgba(36, 22, 16, ${alpha})`;
+        ctx.lineWidth = lw;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(cr.x - off, cr.y - off);
+        for (const p of br) ctx.lineTo(cr.x + p.x * lenMul - off, cr.y + p.y * lenMul - off);
+        ctx.strokeStyle = `rgba(255, 244, 226, ${0.45 * alpha})`;
+        ctx.lineWidth = lw * 0.4;
+        ctx.stroke();
+      }
+    }
+  }
+
+  // 落下中の段の底面（木口）。段の中心を原点、下端 y = SEG_H/2 を中心にした横幅いっぱいの楕円（縦半径 bb = 下端の弧の膨らみ）。
+  // 影の中なので暗い茶に薄い年輪。着地に近づくほど潰れて消える。側面より先に描き、下の段の側面がこの上に重なる
+  function drawLogFace(ctx, pat, bb) {
+    const R = SEG_R;
+    const y = SEG_H / 2;
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(0, y, R, bb, 0, 0, TAU);
+    ctx.fillStyle = pat.base;
+    ctx.fill();
+    ctx.fillStyle = LOG_FACE;
+    ctx.fill();
+    ctx.clip();
+    const cx = pat.faceOff * R;
+    ctx.strokeStyle = 'rgba(220, 180, 120, 0.18)';
+    ctx.lineWidth = 2;
+    for (const f of pat.faceRings) {
+      ctx.beginPath();
+      ctx.ellipse(cx, y, f * (R - Math.abs(cx)), f * bb, 0, 0, TAU);
+      ctx.stroke();
+    }
+    ctx.fillStyle = 'rgba(220, 180, 120, 0.25)';
+    ctx.beginPath();
+    ctx.ellipse(cx, y, 4, Math.max(0.3, bb * 0.06), 0, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = WA.sumi;
+    ctx.beginPath();
+    ctx.ellipse(0, y, R, bb, 0, 0, TAU);
+    ctx.stroke();
+  }
+
+  // 脆い段＝縦に立つ丸太の側面（段の中心を原点）。bt / bb は上端・下端の弧の膨らみ。
+  // 焼いた模様を輪郭で切り抜き、その上に上の段が落とす暗がり・接地の影・切り縁の帯・縁の欠け・ヒビを描き、墨の輪郭で締める
+  function drawLogSide(ctx, seg, bt, bb) {
+    const R = SEG_R;
     const w = SEG_W;
     const h = SEG_H;
-    const hard = seg.kind === 'hard';
+    const ext = LOG_TEX_EXT;
+    if (!seg.pattern) seg.pattern = makeLogPattern(hash3(seg.id || 0, 0, 977)); // 保険（通常は生成時のものを使う）
+    const pat = seg.pattern;
+    segOutline(ctx, bt, bb);
+    ctx.save();
+    ctx.clip();
+    ctx.drawImage(barkTexture(pat), -R, -h / 2 - ext, w, h + 2 * ext);
+    // 上の段が落とす暗がり：上端から 70px まで 0.35 → 0（静止時は 40px だけ画面に見え、「上に何かある」合図になる）。弧のはみ出し分も暗く
+    let g = ctx.createLinearGradient(0, -h / 2, 0, -h / 2 + 70);
+    g.addColorStop(0, `rgba(${LOG_SHADE}, 0.35)`);
+    g.addColorStop(1, `rgba(${LOG_SHADE}, 0)`);
+    ctx.fillStyle = g;
+    ctx.fillRect(-R, -h / 2 - ext, w, 70 + ext);
+    // 接地の影：下端から 28px まで 0.30 → 0
+    g = ctx.createLinearGradient(0, h / 2 - 28, 0, h / 2);
+    g.addColorStop(0, `rgba(${LOG_SHADE}, 0)`);
+    g.addColorStop(1, `rgba(${LOG_SHADE}, 0.3)`);
+    ctx.fillStyle = g;
+    ctx.fillRect(-R, h / 2 - 28, w, 28 + ext);
+    // 切り縁の帯：弧に沿って 3px の明るい木色と、その内側に 2px の暗線（木口を見せずに「切った」と伝える）
+    ctx.lineCap = 'butt';
+    for (const [y, b, dir] of [
+      [-h / 2, bt, 1],
+      [h / 2, bb, -1],
+    ]) {
+      ctx.strokeStyle = LOG_EDGE_LIGHT;
+      ctx.lineWidth = 3;
+      edgeArcPath(ctx, y + dir * 1.5, b);
+      ctx.stroke();
+      ctx.strokeStyle = LOG_EDGE_DARK;
+      ctx.lineWidth = 2;
+      edgeArcPath(ctx, y + dir * 4, b);
+      ctx.stroke();
+    }
+    // 縁から垂れる欠け：鋸で切ったときに樹皮が欠けた表現（淡い木色の半楕円）
+    ctx.fillStyle = 'rgba(226, 199, 150, 0.8)';
+    for (const c of pat.chips) {
+      const ay = c.top ? arcY(c.x, -h / 2, bt) : arcY(c.x, h / 2, bb);
+      ctx.beginPath();
+      if (c.top) ctx.ellipse(c.x, ay, c.w / 2, c.d, 0, 0, Math.PI);
+      else ctx.ellipse(c.x, ay, c.w / 2, c.d, 0, Math.PI, TAU);
+      ctx.fill();
+    }
+    drawSegCracks(ctx, seg, -h / 2 - ext, h + 2 * ext);
+    ctx.restore();
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = WA.sumi;
+    segOutline(ctx, bt, bb);
+    ctx.stroke();
+  }
+
+  // 硬い段＝暗い石に金属の帯（段の中心を原点。見た目は従来のまま、角丸の長方形）
+  function drawStoneBody(ctx, seg) {
+    const w = SEG_W;
+    const h = SEG_H;
     const corner = 16;
     ctx.lineWidth = 5;
     ctx.strokeStyle = WA.sumi;
@@ -1732,77 +2121,52 @@
     ctx.fill();
     ctx.save();
     ctx.clip();
-    if (hard) {
-      // 上面の光と下の影
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
-      ctx.fillRect(-w / 2, -h / 2, w, 22);
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
-      ctx.fillRect(-w / 2, h / 2 - 20, w, 20);
-      // 石の肌：まばらな暗い斑
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.16)';
-      for (let i = 0; i < 24; i++) {
-        const sx = -w / 2 + 40 + ((i * 197) % (w - 80));
-        const sy = -h / 2 + 50 + ((i * 131) % (h - 100));
+    // 上面の光と下の影
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
+    ctx.fillRect(-w / 2, -h / 2, w, 22);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
+    ctx.fillRect(-w / 2, h / 2 - 20, w, 20);
+    // 石の肌：まばらな暗い斑
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.16)';
+    for (let i = 0; i < 24; i++) {
+      const sx = -w / 2 + 40 + ((i * 197) % (w - 80));
+      const sy = -h / 2 + 50 + ((i * 131) % (h - 100));
+      ctx.beginPath();
+      ctx.ellipse(sx, sy, 18 + (i % 3) * 6, 8 + (i % 2) * 4, (i * 0.7) % 1, 0, TAU);
+      ctx.fill();
+    }
+    // 金属の帯：上下に 2 本、鋲を打つ
+    for (const by of [-h / 2 + 44, h / 2 - 44]) {
+      ctx.fillStyle = HARD_BAND;
+      ctx.fillRect(-w / 2, by - 13, w, 26);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+      ctx.fillRect(-w / 2, by - 13, w, 7);
+      ctx.strokeStyle = 'rgba(42, 37, 34, 0.7)';
+      ctx.lineWidth = 2.5;
+      ctx.strokeRect(-w / 2, by - 13, w, 26);
+      ctx.fillStyle = WA.sumi;
+      for (let rx = -w / 2 + 40; rx < w / 2 - 20; rx += 64) {
         ctx.beginPath();
-        ctx.ellipse(sx, sy, 18 + (i % 3) * 6, 8 + (i % 2) * 4, (i * 0.7) % 1, 0, TAU);
+        ctx.arc(rx, by, 5.5, 0, TAU);
         ctx.fill();
       }
-      // 金属の帯：上下に 2 本、鋲を打つ
-      for (const by of [-h / 2 + 44, h / 2 - 44]) {
-        ctx.fillStyle = HARD_BAND;
-        ctx.fillRect(-w / 2, by - 13, w, 26);
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
-        ctx.fillRect(-w / 2, by - 13, w, 7);
-        ctx.strokeStyle = 'rgba(42, 37, 34, 0.7)';
-        ctx.lineWidth = 2.5;
-        ctx.strokeRect(-w / 2, by - 13, w, 26);
-        ctx.fillStyle = WA.sumi;
-        for (let rx = -w / 2 + 40; rx < w / 2 - 20; rx += 64) {
-          ctx.beginPath();
-          ctx.arc(rx, by, 5.5, 0, TAU);
-          ctx.fill();
-        }
-      }
-    } else {
-      // 脆い段：巨大な丸太
-      drawLogBody(ctx, seg);
     }
-    // ヒビ。段階：0 = 薄い、1 = 中、2 = 大（打数の割合で決まる）。巨大な段の全面で読めるよう太く長く描く。
-    // 樹皮の筋（幅 5 以下・alpha 0.3 以下）と紛れないよう、ヒビは太く濃いまま
-    if (seg.cracks.length) {
-      const stage = stageOf(Math.min(seg.hits, seg.maxHp - 1), seg.maxHp);
-      const lenMul = [0.45, 0.8, 1.2][stage];
-      const lw = [3.5, 5.5, 8][stage];
-      const alpha = [0.55, 0.9, 1][stage];
-      const off = lw * 0.3; // 明るい線の添え方（割れ目の片側）
-      if (stage >= 1) {
-        ctx.fillStyle = `rgba(0, 0, 0, ${0.07 * stage})`;
-        ctx.fillRect(-w / 2, -h / 2, w, h);
-      }
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      for (const cr of seg.cracks) {
-        for (const br of cr.branches) {
-          ctx.beginPath();
-          ctx.moveTo(cr.x, cr.y);
-          for (const p of br) ctx.lineTo(cr.x + p.x * lenMul, cr.y + p.y * lenMul);
-          ctx.strokeStyle = `rgba(36, 22, 16, ${alpha})`;
-          ctx.lineWidth = lw;
-          ctx.stroke();
-          ctx.beginPath();
-          ctx.moveTo(cr.x - off, cr.y - off);
-          for (const p of br) ctx.lineTo(cr.x + p.x * lenMul - off, cr.y + p.y * lenMul - off);
-          ctx.strokeStyle = `rgba(255, 244, 226, ${0.45 * alpha})`;
-          ctx.lineWidth = lw * 0.4;
-          ctx.stroke();
-        }
-      }
-    }
+    drawSegCracks(ctx, seg, -h / 2, h);
     ctx.restore();
     ctx.lineWidth = 5;
     ctx.strokeStyle = WA.sumi;
     roundRect(ctx, -w / 2, -h / 2, w, h, corner);
     ctx.stroke();
+  }
+
+  // 段の本体。中心を原点に描く。seg は { kind, color, pattern, cracks, hits, maxHp } を持つ。
+  // topY / bottomY は段の上端・下端の画面上の高さ（縮みや回転をかける前の値）。脆い段の縁の弧の膨らみをこれで決める
+  function drawSegmentBody(ctx, seg, topY, bottomY) {
+    if (seg.kind === 'hard') {
+      drawStoneBody(ctx, seg);
+      return;
+    }
+    drawLogSide(ctx, seg, arcBulge(topY), arcBulge(bottomY));
   }
 
   // 奥へ吹っ飛ぶ段：一点（CENTER_X, VANISH_Y）へ縮みながら上がって消える。塔より奥に描く。
@@ -1818,23 +2182,41 @@
       ctx.translate(b.cx, y);
       ctx.rotate((b.id % 2 ? 1 : -1) * 0.45 * t);
       ctx.scale(sc, sc);
-      drawSegmentBody(ctx, b);
+      // 輪郭の弧は吹っ飛ぶ前の高さのまま（回転・縮小するだけで新しい面は見せない）
+      drawSegmentBody(ctx, b, b.cy - SEG_H / 2, b.cy + SEG_H / 2);
       ctx.restore();
     }
   }
 
   function drawTower(ctx, k) {
     const stopped = phase === 'timestop';
+    // 落下中で下に隙間のある脆い段は、下端が水平線より上にある間だけ底面（木口）が下から覗く。
+    // 側面より先に描いておき、下の段（または落下先の段）の側面がこの上に重なるようにする（手前の縁が奥の底面を隠す向き）
+    for (let i = 0; i < segments.length; i++) {
+      const s = segments[i];
+      if (s.kind === 'hard' || s.dispDy >= 0) continue;
+      if (i > 0 && segments[i - 1].dispDy <= s.dispDy + 0.5) continue; // 下の段と一緒に落ちている（隙間なし）
+      const v = segVisual(i);
+      const bottomY = v.cy + SEG_H / 2;
+      const bb = arcBulge(bottomY);
+      if (bb <= 0.5 || bottomY + bb + 8 < 0) continue;
+      ctx.save();
+      ctx.translate(v.cx, v.cy);
+      drawLogFace(ctx, s.pattern, bb);
+      ctx.restore();
+    }
     for (let i = 0; i < segments.length; i++) {
       const v = segVisual(i);
-      if (v.cy + SEG_H / 2 + 8 < 0) continue; // 画面の上端より外にある段は描かない（並びは segments のまま保つ）
+      const topY = v.cy - SEG_H / 2;
+      const bottomY = v.cy + SEG_H / 2;
+      if (bottomY + ARC_MAX + 8 < 0) continue; // 画面の上端より外にある段は描かない（並びは segments のまま保つ。縁の弧のはみ出し分を見込む）
       // 着地の縮み：下端を支点に横へ少し潰れる（重い塊が落ちた手触り。跳ねはしない）
       const sq = 0.05 * Math.sin(Math.PI * segments[i].bounce);
       ctx.save();
       ctx.translate(v.cx, v.cy + SEG_H / 2);
       ctx.scale(1 + sq, 1 - sq);
       ctx.translate(0, -SEG_H / 2);
-      drawSegmentBody(ctx, segments[i]);
+      drawSegmentBody(ctx, segments[i], topY, bottomY);
       ctx.restore();
     }
     // 敵だるま。足元を支点に傾き・前のめり・着地の縮み。破裂したら描かない
@@ -2174,6 +2556,7 @@
   }
 
   function render(ctx, k, now) {
+    viewK = k;
     ctx.setTransform(k, 0, 0, k, 0, 0);
     ctx.fillStyle = PAPER;
     ctx.fillRect(0, 0, W, H);
