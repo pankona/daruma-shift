@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>オラオラだるまおとし（吹っ飛ばし試作）</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="stage-wrap">
+    <canvas id="game" width="960" height="540"></canvas>
+
+    <div id="hud">
+      <button id="btn-go" hidden>発動</button>
+    </div>
+
+    <div id="title">
+      <div class="box">
+        <h1>オラオラだるまおとし（吹っ飛ばし試作）</h1>
+        <p>時が止まっている間に、飛来物の迎撃と殴る段を決める。<br>段は殴るたびにヒビが入り、耐久が尽きると奥へ吹っ飛ぶ。上の段とだるまは一段分落ちる。<br>段を全部吹っ飛ばして、だるまを台に落とせば勝ち。飛来物を漏らして自分が砕けたら負け。</p>
+        <button id="btn-start">開始</button>
+      </div>
+    </div>
+
+    <div id="result" hidden>
+      <div class="box">
+        <div id="result-text"></div>
+        <div id="result-sub"></div>
+        <button id="btn-retry">もう一度</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="game.js"></script>
+</body>
+</html>
