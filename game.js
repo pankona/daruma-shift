@@ -31,6 +31,24 @@
 
   const WORRY_ANGLE = 0.35;
 
+  // ---- 演出の調整値（ルールには関わらない） ----------------------------
+  const HITSTOP_MS = [50, 90]; // power 0 → 1 で線形
+  const SHAKE_MAX = 5; // 画面振動の上限（論理px）
+  const SHAKE_MS = 130;
+  const SLOWMO_FACTOR = 0.35;
+  const SLOWMO_MS = 500; // 実時間
+  const LAND_MIN_SPEED = 1.2; // これより遅い接触は着地音を鳴らさない
+  const LAND_COOLDOWN_STEPS = 10; // 同じボディの着地音の間隔
+  // ヒヤリ：だるまが動いていて、台の端近くで大きく傾いている／端からはみ出している
+  const DANGER_MOVING_SPEED = 0.25;
+  const DANGER_MOVING_ANGULAR = 0.015;
+  const DANGER_EDGE_DIST = 45; // 傾き判定に使う「端の近く」（だるまの中心から台の端まで）
+  const DANGER_OVERHANG = DARUMA_W * 0.2; // はみ出し（約23px）
+  // スローモーション：端からのはみ出し＋傾き or 角速度（ヒヤリより厳しめ）
+  const TEETER_OVERHANG = DARUMA_W * 0.25; // 約29px
+  const TEETER_TILT = 0.2;
+  const TEETER_ANGULAR = 0.03;
+
   // だるまの本番素材（ドット絵）。読み込めなかった場合は仮描画にフォールバックする。
   const darumaImage = new Image();
   let darumaImageReady = false;
@@ -217,6 +235,7 @@
     simSteps = 0;
     aim = null;
 
+    fx.reset();
     if (ui) ui.onStageLoaded();
   }
 
@@ -229,6 +248,14 @@
         lose();
         return;
       }
+    }
+  });
+
+  // 着地の音（演出のみ。判定には関わらない）
+  Events.on(engine, 'collisionStart', (ev) => {
+    if (phase === 'won' || phase === 'lost') return;
+    for (const pair of ev.pairs) {
+      fx.onContact(pair.bodyA, pair.bodyB);
     }
   });
 
@@ -334,6 +361,7 @@
     phase = 'won';
     result = 'clear';
     aim = null;
+    fx.onWin();
     emitResult();
   }
 
@@ -342,6 +370,7 @@
     phase = 'lost';
     result = 'fail';
     aim = null;
+    fx.onLose();
     emitResult();
   }
 
@@ -375,6 +404,7 @@
     evalPending = true;
     reEvalOnRest = false;
     strikes++;
+    fx.onStrike(b, dir, p);
     return true;
   }
 
@@ -443,6 +473,7 @@
     heavy: { fill: '#5b3a28', grain: '#7d5640' },
   };
 
+  // 論理座標の世界を描く（カメラと振動の変換は呼び出し側でかける）
   function drawScene(ctx) {
     ctx.fillStyle = PAPER;
     ctx.fillRect(0, 0, W, H);
@@ -474,9 +505,13 @@
     for (const b of blocks) if (!b.removed) drawBlock(ctx, b);
 
     drawDaruma(ctx, daruma);
+    fx.drawWorld(ctx);
 
     if (aim) drawAim(ctx);
+  }
 
+  // 画面に固定して描くもの（カメラの寄りや振動の影響を受けない）
+  function drawOverlay(ctx) {
     // 操作の手引き
     ctx.fillStyle = 'rgba(42,37,34,0.55)';
     ctx.font = '15px "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", serif';
@@ -484,6 +519,8 @@
     ctx.textBaseline = 'middle';
     const hint = canAim() ? '段を押さえて引き、離すと叩く' : phase === 'moving' ? '……' : '';
     if (hint && (phase === 'ready' || phase === 'moving')) ctx.fillText(hint, W / 2, FLOOR_Y + 14);
+
+    fx.drawOverlay(ctx);
   }
 
   function drawPlatform(ctx, p) {
@@ -516,11 +553,11 @@
   }
 
   function drawBlock(ctx, b) {
-    const body = b.body;
     const st = BLOCK_STYLE[b.type];
+    const ps = pose(b.body);
     ctx.save();
-    ctx.translate(body.position.x, body.position.y);
-    ctx.rotate(body.angle);
+    ctx.translate(ps.x, ps.y);
+    ctx.rotate(ps.angle);
     const hw = BLOCK_W / 2;
     const hh = BLOCK_H / 2;
 
@@ -580,6 +617,33 @@
     ctx.closePath();
   }
 
+  // 描画用の姿勢。スロー中は物理の1ステップが数フレームにまたがるので、
+  // 次のステップまでの経過分を速度で先読みして滑らかに見せる（論理座標は変えない）。
+  function pose(body) {
+    const t = fx.renderLead();
+    if (t <= 0) return { x: body.position.x, y: body.position.y, angle: body.angle };
+    return {
+      x: body.position.x + body.velocity.x * t,
+      y: body.position.y + body.velocity.y * t,
+      angle: body.angle + body.angularVelocity * t,
+    };
+  }
+
+  // だるまの座標系へ移す：外形の中心が原点。ボディの傾きに、表情としての傾き（下端の中央が支点）を足す
+  function applyDarumaTransform(ctx, body) {
+    const ps = pose(body);
+    ctx.translate(ps.x, ps.y);
+    ctx.rotate(ps.angle);
+    // 物理の位置は重心なので、外形の中心へずらしてから描く
+    ctx.translate(0, darumaShapeOffsetY);
+    const lean = fx.darumaLean();
+    if (lean) {
+      ctx.translate(0, DARUMA_H / 2);
+      ctx.rotate(lean);
+      ctx.translate(0, -DARUMA_H / 2);
+    }
+  }
+
   function drawDaruma(ctx, body) {
     if (darumaImageReady) {
       drawDarumaImage(ctx, body);
@@ -599,10 +663,7 @@
     const dx = -(box.x + box.w / 2) * scale;
     const dy = DARUMA_H / 2 - (box.y + box.h) * scale;
     ctx.save();
-    ctx.translate(body.position.x, body.position.y);
-    ctx.rotate(body.angle);
-    // 物理の位置は重心なので、外形の中心へずらしてから描く
-    ctx.translate(0, darumaShapeOffsetY);
+    applyDarumaTransform(ctx, body);
     ctx.imageSmoothingEnabled = false; // ドット絵をくっきり見せる
     ctx.drawImage(img, dx, dy, dw, dh);
     ctx.restore();
@@ -614,10 +675,7 @@
     const hh = DARUMA_H / 2;
     const worried = Math.abs(normalizeAngle(body.angle)) > WORRY_ANGLE || phase === 'lost';
     ctx.save();
-    ctx.translate(body.position.x, body.position.y);
-    ctx.rotate(body.angle);
-    // 物理の位置は重心なので、外形の中心へずらしてから描く
-    ctx.translate(0, darumaShapeOffsetY);
+    applyDarumaTransform(ctx, body);
 
     // 頭（上が丸く、下が平ら）
     roundRectPath(ctx, -hw, -hh, DARUMA_W, DARUMA_H, [DARUMA_TOP_R, DARUMA_TOP_R, 0, 0]);
@@ -685,9 +743,9 @@
 
   function drawAim(ctx) {
     const v = aimVector();
-    const body = aim.block.body;
-    const cx = body.position.x;
-    const cy = body.position.y;
+    const ps = pose(aim.block.body);
+    const cx = ps.x;
+    const cy = ps.y;
 
     // 引いている線（薄く）
     ctx.strokeStyle = 'rgba(42,37,34,0.25)';
@@ -730,6 +788,585 @@
     return a > Math.PI ? a - t : a;
   }
 
+  // ---- 音（WebAudio の合成。素材ファイルは使わない） --------------------
+  const sound = (function () {
+    let ac = null;
+    let out = null;
+    let noise = null;
+    let nextLandAt = 0;
+
+    // 自動再生の制限があるので、最初のポインター操作で作る
+    function init() {
+      if (ac) {
+        if (ac.state === 'suspended') ac.resume();
+        return;
+      }
+      const AC = typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext);
+      if (!AC) return;
+      ac = new AC();
+      const comp = ac.createDynamicsCompressor();
+      comp.connect(ac.destination);
+      out = ac.createGain();
+      out.gain.value = 0.6;
+      out.connect(comp);
+      noise = ac.createBuffer(1, Math.floor(ac.sampleRate * 0.4), ac.sampleRate);
+      const d = noise.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+
+    function live() {
+      return ac && ac.state === 'running';
+    }
+
+    // 音程つきの短い音。f0 から f1 へ滑らせ、指数で減衰させる
+    function tone(f0, f1, at, dur, vol, type) {
+      const o = ac.createOscillator();
+      const g = ac.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(f0, at);
+      o.frequency.exponentialRampToValueAtTime(f1, at + dur);
+      g.gain.setValueAtTime(0.0001, at);
+      g.gain.exponentialRampToValueAtTime(vol, at + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+      o.connect(g);
+      g.connect(out);
+      o.start(at);
+      o.stop(at + dur + 0.02);
+    }
+
+    // 雑音を帯域で絞った短い音（打撃の「カッ」、太鼓の皮鳴り）
+    function hiss(at, dur, vol, type, freq, q) {
+      const s = ac.createBufferSource();
+      s.buffer = noise;
+      const f = ac.createBiquadFilter();
+      f.type = type;
+      f.frequency.value = freq;
+      f.Q.value = q;
+      const g = ac.createGain();
+      g.gain.setValueAtTime(vol, at);
+      g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+      s.connect(f);
+      f.connect(g);
+      g.connect(out);
+      s.start(at);
+      s.stop(at + dur + 0.02);
+    }
+
+    // 陽音階（レ・ミ・ソ・ラ・シ）の下から i 番目
+    const YO = [0, 2, 5, 7, 9];
+    function scale(i) {
+      const semi = 12 * Math.floor(i / 5) + YO[i % 5];
+      return 293.66 * Math.pow(2, semi / 12);
+    }
+
+    // 木の当たる音
+    function wood(i, vol, at) {
+      const f = scale(i);
+      tone(f, f * 0.97, at, 0.18, 0.32 * vol, 'triangle');
+      tone(f * 2.4, f * 2.3, at, 0.05, 0.1 * vol, 'sine');
+      hiss(at, 0.02, 0.18 * vol, 'bandpass', f * 4, 2);
+    }
+
+    return {
+      init,
+      // 木槌：強く叩くほど大きく、音程も高い
+      strike(p) {
+        if (!live()) return;
+        const t = ac.currentTime;
+        const f = 240 + 260 * p;
+        hiss(t, 0.05 + 0.03 * p, 0.25 + 0.5 * p, 'bandpass', 1200 + 1400 * p, 1.4);
+        tone(f, f * 0.55, t, 0.1, 0.25 + 0.5 * p, 'triangle');
+        tone(130, 70, t, 0.09, 0.15 + 0.35 * p, 'sine');
+      },
+      // 着地：同じ打撃の中で i 番目の着地。同時の着地は少しずらして階段に聞こえるようにする
+      land(i, vol) {
+        if (!live()) return;
+        const at = Math.max(ac.currentTime, nextLandAt);
+        nextLandAt = at + 0.045;
+        wood(Math.min(i, 9), vol, at);
+      },
+      clear() {
+        if (!live()) return;
+        const t = ac.currentTime;
+        // 太鼓の一打
+        tone(95, 48, t, 0.55, 0.9, 'sine');
+        hiss(t, 0.1, 0.35, 'lowpass', 350, 0.7);
+        // 木の音の上昇
+        [5, 6, 7, 9].forEach((n, k) => wood(n, k === 3 ? 1 : 0.8, t + 0.18 + k * 0.085));
+      },
+      fail() {
+        if (!live()) return;
+        tone(120, 72, ac.currentTime, 0.4, 0.45, 'triangle');
+      },
+    };
+  })();
+
+  // ---- 演出（ヒットストップ・振動・火花・表情・カメラ・スロー・クリア演出） ----
+  // ゲームの状態は読むだけで書き換えない。Engine.update の刻み（STEP_MS）にも触れず、
+  // ヒットストップとスローは「実時間に対して物理を何ステップ進めるか」だけで表す。
+  // そのため __game.step() で進めるヘッドレスの結果は演出の有無で変わらない。
+  const MINCHO = '"Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", serif';
+  const WA = { shu: '#d9482b', kin: '#d9a83a', shiro: '#fbf6ea', ai: '#2e4a7a' };
+
+  // だるまが「ヒヤリ」「端で落ちるか止まるか」の状態か
+  function darumaDanger() {
+    const b = daruma.bounds;
+    const tilt = Math.abs(normalizeAngle(daruma.angle));
+    const angular = daruma.angularSpeed;
+    const moving = daruma.speed > DANGER_MOVING_SPEED || angular > DANGER_MOVING_ANGULAR;
+    // 支えの台：横に重なっていて、だるまの下端が上面より下がりきっていない台のうち一番高いもの
+    let plat = null;
+    for (const q of platforms) {
+      if (b.max.x < q.x - q.w / 2 || b.min.x > q.x + q.w / 2) continue;
+      if (b.max.y > q.top + 30) continue;
+      if (!plat || q.top < plat.top) plat = q;
+    }
+    if (!plat) return { hiyari: false, teeter: false, overhang: 0, edgeDist: null, tilt, angular, moving };
+    const l = plat.x - plat.w / 2;
+    const r = plat.x + plat.w / 2;
+    const overhang = Math.max(0, l - b.min.x, b.max.x - r);
+    const edgeDist = Math.min(daruma.position.x - l, r - daruma.position.x); // 負なら重心が台の外
+    const hiyari =
+      moving && ((tilt > WORRY_ANGLE && edgeDist < DANGER_EDGE_DIST) || overhang > DANGER_OVERHANG);
+    // 重心はまだ台の上、外形は端から大きくはみ出し、傾いているか回っている
+    const teeter =
+      moving && edgeDist > 0 && overhang > TEETER_OVERHANG && (tilt > TEETER_TILT || angular > TEETER_ANGULAR);
+    return { hiyari, teeter, overhang, edgeDist, tilt, angular, moving };
+  }
+
+  const fx = (function () {
+    let hitstopMs = 0;
+    let shakeMs = 0;
+    let shakeAmp = 0;
+    let shakeX = 0;
+    let shakeY = 0;
+    let slowMs = 0;
+    let slowUsed = false; // 1回の打撃につき1回まで
+    let lead = 0; // 描画の先読み量（ステップ単位、スロー中だけ）
+    let armed = false; // 一度でも叩いたか（面の最初の積み上がりで鳴らさない）
+    let landSeq = 0;
+    const lastLand = new Map(); // body.id → 最後に着地音を鳴らした simSteps
+    let hiyariHold = 0;
+    let hiyariZoomUsed = false;
+    let lean = 0;
+    let time = 0;
+    let flash = null;
+    let banner = null;
+    const sparks = [];
+    const petals = [];
+    const cam = { z: 1, target: 1, holdMs: 0, fx: W / 2, fy: H / 2, cx: W / 2, cy: H / 2 };
+
+    function reset() {
+      hitstopMs = shakeMs = shakeX = shakeY = slowMs = lead = 0;
+      slowUsed = armed = hiyariZoomUsed = false;
+      landSeq = 0;
+      lastLand.clear();
+      hiyariHold = lean = 0;
+      flash = banner = null;
+      sparks.length = 0;
+      petals.length = 0;
+      Object.assign(cam, { z: 1, target: 1, holdMs: 0, fx: W / 2, fy: H / 2, cx: W / 2, cy: H / 2 });
+    }
+
+    function zoom(z, holdMs) {
+      cam.target = Math.max(cam.target, z);
+      cam.holdMs = Math.max(cam.holdMs, holdMs);
+    }
+
+    function darumaCenter() {
+      return { x: (daruma.bounds.min.x + daruma.bounds.max.x) / 2, y: (daruma.bounds.min.y + daruma.bounds.max.y) / 2 };
+    }
+
+    function spawnSparks(x, y, dir, p) {
+      const n = Math.round(5 + 9 * p);
+      const back = Math.atan2(-dir.y, -dir.x); // 槌が来た側へ散る
+      for (let i = 0; i < n; i++) {
+        const ang = back + (Math.random() - 0.5) * 2.6;
+        const sp = 0.15 + 0.25 * p + Math.random() * 0.2; // px/ms
+        sparks.push({
+          x,
+          y,
+          vx: Math.cos(ang) * sp,
+          vy: Math.sin(ang) * sp - 0.12,
+          life: 160 + Math.random() * 220,
+          age: 0,
+          color: Math.random() < 0.55 ? WA.kin : '#ffffff',
+        });
+      }
+      flash = { x, y, age: 0 };
+    }
+
+    function spawnPetals() {
+      const colors = [WA.shu, WA.kin, WA.shiro, WA.ai];
+      for (let i = 0; i < 64; i++) {
+        petals.push({
+          x: Math.random() * W,
+          y: -20 - Math.random() * 60,
+          wait: Math.random() * 700,
+          vy: 0.05 + Math.random() * 0.06,
+          vx: -0.015 + Math.random() * 0.03,
+          sway: 0.02 + Math.random() * 0.03,
+          ph: Math.random() * Math.PI * 2,
+          rot: Math.random() * Math.PI * 2,
+          vr: (Math.random() - 0.5) * 0.006,
+          flip: Math.random() * Math.PI * 2,
+          size: 5 + Math.random() * 4,
+          color: colors[i % colors.length],
+          momiji: Math.random() < 0.4,
+        });
+      }
+    }
+
+    function makeBanner(text) {
+      const dots = [];
+      for (let i = 0; i < 9; i++) {
+        const side = Math.random() < 0.5 ? -1 : 1;
+        dots.push({
+          x: side * (60 + Math.random() * 150),
+          y: (Math.random() - 0.5) * 120,
+          r: 1.5 + Math.random() * 4.5,
+        });
+      }
+      return { text, age: 0, rot: -0.05 - Math.random() * 0.04, dots };
+    }
+
+    return {
+      reset,
+      danger: darumaDanger,
+
+      onStrike(b, dir, p) {
+        armed = true;
+        landSeq = 0;
+        lastLand.clear();
+        slowUsed = false;
+        hiyariZoomUsed = false;
+        hitstopMs = HITSTOP_MS[0] + (HITSTOP_MS[1] - HITSTOP_MS[0]) * p;
+        shakeAmp = Math.min(SHAKE_MAX, 1 + 4 * p);
+        shakeMs = SHAKE_MS;
+        // 打点：槌が当たる側の面（叩く向きの反対側）
+        spawnSparks(b.body.position.x - (dir.x * BLOCK_W) / 2, b.body.position.y - (dir.y * BLOCK_H) / 2, dir, p);
+        sound.strike(p);
+      },
+
+      // 段が床・台に、だるまが台・段に着地したら木の音。同じ打撃の中では音程を1段ずつ上げる
+      onContact(a, o) {
+        if (!armed) return;
+        for (const [m, other] of [
+          [a, o],
+          [o, a],
+        ]) {
+          const ground = other.label === 'floor' || other.label === 'platform';
+          if (m.label === 'block') {
+            if (!ground) continue;
+          } else if (m === daruma) {
+            if (other.label !== 'platform' && other.label !== 'block') continue; // 床は負けの音に任せる
+          } else continue;
+          if (m.speed < LAND_MIN_SPEED) continue;
+          const prev = lastLand.get(m.id);
+          if (prev != null && simSteps - prev < LAND_COOLDOWN_STEPS) continue;
+          lastLand.set(m.id, simSteps);
+          sound.land(landSeq++, Math.min(1, 0.35 + m.speed / 8));
+        }
+      },
+
+      onWin() {
+        slowMs = 0;
+        banner = makeBanner(strikes === 1 ? '一撃' : 'お見事');
+        spawnPetals();
+        zoom(1.25, 1100);
+        sound.clear();
+      },
+
+      onLose() {
+        slowMs = 0;
+        sound.fail();
+      },
+
+      hitstopActive() {
+        return hitstopMs > 0;
+      },
+
+      // 実時間に対する物理の進み（スローは終わり際 120ms で通常へ戻す）
+      timeFactor() {
+        if (slowMs <= 0) return 1;
+        if (slowMs < 120) return SLOWMO_FACTOR + (1 - SLOWMO_FACTOR) * (1 - slowMs / 120);
+        return SLOWMO_FACTOR;
+      },
+
+      renderLead() {
+        return lead;
+      },
+
+      darumaLean() {
+        return lean;
+      },
+
+      mood() {
+        if (phase === 'won') return 'relief';
+        if (phase === 'aiming') return 'aim';
+        if (hiyariHold > 0 && phase !== 'lost') return 'hiyari';
+        return 'normal';
+      },
+
+      // dt：実時間（ms）、accSteps：次の物理ステップまでの経過（ステップ単位）
+      update(dt, accSteps) {
+        time += dt;
+        const aiming = phase === 'aiming';
+        if (hitstopMs > 0) hitstopMs -= dt;
+        if (!aiming && slowMs > 0) slowMs -= dt;
+        lead = slowMs > 0 && !aiming && hitstopMs <= 0 ? Math.min(1, accSteps) : 0;
+
+        // ヒヤリとスローの判定
+        if (phase === 'moving' || phase === 'ready') {
+          const d = darumaDanger();
+          if (d.hiyari) {
+            hiyariHold = 400;
+            if (phase === 'moving' && !hiyariZoomUsed) {
+              hiyariZoomUsed = true;
+              zoom(1.18, 700);
+            }
+          }
+          if (phase === 'moving' && d.teeter && !slowUsed) {
+            slowUsed = true;
+            slowMs = SLOWMO_MS;
+          }
+        }
+        if (hiyariHold > 0) hiyariHold -= dt;
+
+        // 狙い中：狙う向きへわずかに傾き、強く引くほど小さく震える
+        let leanTarget = 0;
+        if (aiming) {
+          const v = aimVector();
+          if (v && !v.cancel) leanTarget = v.dir.x * (0.03 + 0.06 * v.power) + Math.sin(time * 0.06) * 0.012 * v.power;
+        }
+        lean += (leanTarget - lean) * (1 - Math.exp(-dt / 70));
+
+        // カメラ（狙い中は止めて、ポインターの座標変換を安定させる）
+        if (!aiming) {
+          if (cam.holdMs > 0) cam.holdMs -= dt;
+          else cam.target = 1;
+          const k = 1 - Math.exp(-dt / 180);
+          cam.z += (cam.target - cam.z) * k;
+          const c = darumaCenter();
+          cam.fx += (c.x - cam.fx) * k;
+          cam.fy += (c.y + 20 - cam.fy) * k;
+          const hw = W / (2 * cam.z);
+          const hh = H / (2 * cam.z);
+          cam.cx = Math.max(hw, Math.min(W - hw, cam.fx));
+          cam.cy = Math.max(hh, Math.min(H - hh, cam.fy));
+        }
+
+        // 画面振動
+        if (shakeMs > 0) {
+          shakeMs -= dt;
+          const a = shakeAmp * Math.pow(Math.max(0, shakeMs) / SHAKE_MS, 2);
+          shakeX = (Math.random() * 2 - 1) * a;
+          shakeY = (Math.random() * 2 - 1) * a;
+        } else {
+          shakeX = shakeY = 0;
+        }
+
+        for (let i = sparks.length - 1; i >= 0; i--) {
+          const s = sparks[i];
+          s.age += dt;
+          s.vy += 0.0009 * dt;
+          s.x += s.vx * dt;
+          s.y += s.vy * dt;
+          if (s.age >= s.life) sparks.splice(i, 1);
+        }
+        if (flash) {
+          flash.age += dt;
+          if (flash.age > 90) flash = null;
+        }
+
+        for (let i = petals.length - 1; i >= 0; i--) {
+          const p = petals[i];
+          if (p.wait > 0) {
+            p.wait -= dt;
+            continue;
+          }
+          p.ph += dt * 0.003;
+          p.x += (p.vx + Math.sin(p.ph) * p.sway) * dt;
+          p.y += p.vy * dt;
+          p.rot += p.vr * dt;
+          p.flip += dt * 0.006;
+          if (p.y > H + 20) petals.splice(i, 1);
+        }
+
+        if (banner) banner.age += dt;
+      },
+
+      applyCamera(ctx) {
+        ctx.translate(shakeX, shakeY);
+        ctx.translate(W / 2, H / 2);
+        ctx.scale(cam.z, cam.z);
+        ctx.translate(-cam.cx, -cam.cy);
+      },
+
+      // 画面上の論理座標 → 世界の論理座標（振動は小さいので無視する）
+      screenToWorld(x, y) {
+        return { x: (x - W / 2) / cam.z + cam.cx, y: (y - H / 2) / cam.z + cam.cy };
+      },
+
+      drawWorld(ctx) {
+        // 打点の閃き
+        if (flash) {
+          const k = flash.age / 90;
+          ctx.save();
+          ctx.globalAlpha = 1 - k;
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeStyle = WA.kin;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(flash.x, flash.y, 6 + 14 * k, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // 火花（白は紙の地に溶けるので、薄い墨の縁を下に敷く）
+        ctx.save();
+        ctx.lineCap = 'round';
+        for (const s of sparks) {
+          const k = 1 - s.age / s.life;
+          const tx = s.x - s.vx * 16;
+          const ty = s.y - s.vy * 16;
+          ctx.globalAlpha = Math.min(1, k * 1.5);
+          ctx.strokeStyle = 'rgba(42,37,34,0.35)';
+          ctx.lineWidth = 1.5 + 2.5 * k;
+          ctx.beginPath();
+          ctx.moveTo(s.x, s.y);
+          ctx.lineTo(tx, ty);
+          ctx.stroke();
+          ctx.strokeStyle = s.color;
+          ctx.lineWidth = 0.6 + 1.8 * k;
+          ctx.stroke();
+        }
+        ctx.restore();
+
+        const mood = this.mood();
+        const hw = DARUMA_W / 2;
+        const hh = DARUMA_H / 2;
+
+        // ヒヤリ：冷や汗の雫（だるまと一緒に傾ける）
+        if (mood === 'hiyari') {
+          const slide = ((time % 700) / 700) * 6;
+          ctx.save();
+          applyDarumaTransform(ctx, daruma);
+          ctx.translate(hw - 4, -hh + 12 + slide);
+          ctx.beginPath();
+          ctx.moveTo(0, -9);
+          ctx.bezierCurveTo(3, -3, 6, 1, 6, 4);
+          ctx.arc(0, 4, 6, 0, Math.PI);
+          ctx.bezierCurveTo(-6, 1, -3, -3, 0, -9);
+          ctx.fillStyle = '#5b8fd0';
+          ctx.fill();
+          ctx.strokeStyle = WA.ai;
+          ctx.lineWidth = 1.4;
+          ctx.stroke();
+          ctx.fillStyle = 'rgba(255,255,255,0.85)';
+          ctx.beginPath();
+          ctx.arc(-2, 3, 1.6, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // 安堵：横に息のマーク（白い丸の連なりが流れて消える）
+        if (mood === 'relief') {
+          const c = pose(daruma);
+          const ox = c.x + hw + 4;
+          const oy = c.y + darumaShapeOffsetY - 2;
+          ctx.save();
+          ctx.lineWidth = 1.2;
+          ctx.strokeStyle = 'rgba(42,37,34,0.5)';
+          ctx.fillStyle = '#ffffff';
+          for (let i = 0; i < 3; i++) {
+            const ph = (time / 1100 + i / 3) % 1;
+            ctx.globalAlpha = 1 - ph;
+            ctx.beginPath();
+            ctx.arc(ox + ph * 30, oy - ph * 14, 2 + ph * 5, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+      },
+
+      drawOverlay(ctx) {
+        // 花びら紙吹雪
+        for (const p of petals) {
+          if (p.wait > 0) continue;
+          ctx.save();
+          ctx.translate(p.x, p.y);
+          ctx.rotate(p.rot);
+          ctx.scale(Math.max(0.15, Math.abs(Math.cos(p.flip))), 1);
+          const s = p.size;
+          ctx.beginPath();
+          if (p.momiji) {
+            // 紅葉：5つの尖り
+            for (let i = 0; i < 10; i++) {
+              const r = i % 2 === 0 ? s : s * 0.45;
+              const a = -Math.PI / 2 + (i * Math.PI) / 5;
+              if (i === 0) ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+              else ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+            }
+            ctx.closePath();
+          } else {
+            // 桜：先に切れ込みのある花びら
+            ctx.moveTo(0, s);
+            ctx.bezierCurveTo(s * 0.9, s * 0.4, s * 0.7, -s * 0.8, s * 0.2, -s);
+            ctx.lineTo(0, -s * 0.7);
+            ctx.lineTo(-s * 0.2, -s);
+            ctx.bezierCurveTo(-s * 0.7, -s * 0.8, -s * 0.9, s * 0.4, 0, s);
+          }
+          ctx.fillStyle = p.color;
+          ctx.fill();
+          ctx.strokeStyle = 'rgba(42,37,34,0.35)';
+          ctx.lineWidth = 0.8;
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // 筆文字（一瞬だけ）
+        const DUR = 1700;
+        if (banner && banner.age < DUR) {
+          const t = banner.age;
+          const pop = t < 140 ? 1.5 - 0.5 * (1 - Math.pow(1 - t / 140, 3)) : 1;
+          ctx.save();
+          ctx.globalAlpha = t > DUR - 350 ? (DUR - t) / 350 : 1;
+          ctx.translate(W / 2, 128);
+          ctx.rotate(banner.rot);
+          ctx.scale(pop, pop);
+          // 墨の飛沫
+          ctx.fillStyle = INK;
+          for (const d of banner.dots) {
+            ctx.beginPath();
+            ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          ctx.font = `bold 112px ${MINCHO}`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          // にじみ（少しずらした薄墨）を下に敷く
+          ctx.fillStyle = 'rgba(42,37,34,0.22)';
+          ctx.fillText(banner.text, 4, 4);
+          ctx.fillStyle = INK;
+          ctx.fillText(banner.text, 0, 0);
+          // 朱の落款
+          const tw = ctx.measureText(banner.text).width;
+          ctx.translate(tw / 2 + 24, 34);
+          ctx.rotate(0.08);
+          ctx.fillStyle = WA.shu;
+          ctx.fillRect(-15, -15, 30, 30);
+          ctx.fillStyle = WA.shiro;
+          ctx.font = `bold 20px ${MINCHO}`;
+          ctx.fillText('達', 0, 1);
+          ctx.restore();
+        }
+      },
+    };
+  })();
+
   // ---- 画面・入力 ----------------------------------------------------
   let ui = null;
 
@@ -759,11 +1396,12 @@
 
     function toLogical(ev) {
       const rect = canvas.getBoundingClientRect();
-      return {
-        x: ((ev.clientX - rect.left) * W) / rect.width,
-        y: ((ev.clientY - rect.top) * H) / rect.height,
-      };
+      // カメラが寄っているときは、画面上の位置を世界の論理座標へ戻す
+      return fx.screenToWorld(((ev.clientX - rect.left) * W) / rect.width, ((ev.clientY - rect.top) * H) / rect.height);
     }
+
+    // 自動再生の制限への対策：最初のポインター操作で音を用意する（ボタンでも可）
+    window.addEventListener('pointerdown', () => sound.init(), true);
 
     canvas.addEventListener('pointerdown', (ev) => {
       if (aim) return;
@@ -799,22 +1437,23 @@
       resultText.textContent = r === 'clear' ? 'おみごと' : 'だるまが落ちた';
       resultText.className = r === 'clear' ? 'win' : 'lose';
       btnNext.textContent = stageIndex === STAGES.length - 1 ? '最初の面へ' : '次の面';
-      // 失敗表示は少しだけ間を置いて、落ちる様子を見せる
+      // 失敗表示は少しだけ間を置いて、落ちる様子を見せる。クリアは筆文字と寄りを先に見せる
       setTimeout(() => {
         if (result === r) resultEl.hidden = false;
-      }, r === 'clear' ? 300 : 700);
+      }, r === 'clear' ? 900 : 700);
     });
 
-    // 固定ステップのループ。狙っている間はエンジンの更新を止める。
+    // 固定ステップのループ。狙っている間とヒットストップ中はエンジンの更新を止める。
+    // スロー中は実時間の進みを縮めて積む（1ステップの刻みは常に STEP_MS のまま）。
     let last = performance.now();
     let acc = 0;
     function frame(now) {
       const dt = Math.min(now - last, 100);
       last = now;
-      if (phase === 'aiming') {
+      if (phase === 'aiming' || fx.hitstopActive()) {
         acc = 0;
       } else {
-        acc += dt;
+        acc += dt * fx.timeFactor();
         let n = 0;
         while (acc >= STEP_MS && n < 4) {
           step();
@@ -823,9 +1462,17 @@
         }
         if (n === 4) acc = 0;
       }
+      fx.update(dt, acc / STEP_MS);
       const k = canvas.width / W;
       ctx.setTransform(k, 0, 0, k, 0, 0);
+      // 振動で端が覗いても紙色になるよう、先に全面を塗る
+      ctx.fillStyle = PAPER;
+      ctx.fillRect(0, 0, W, H);
+      ctx.save();
+      fx.applyCamera(ctx);
       drawScene(ctx);
+      ctx.restore();
+      drawOverlay(ctx);
       requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
@@ -885,6 +1532,10 @@
     loadStage(n) {
       loadStage(n);
       return this.state();
+    },
+    // 演出用の判定（ヒヤリ・スローの条件）の現在値。演出の調整・確認用
+    danger() {
+      return fx.danger();
     },
     // 物理を n ステップ同期で進める（自動テスト・ヘッドレス用）
     step(n = 1) {
