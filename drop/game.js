@@ -96,9 +96,11 @@
 
   const ATTACK_MS = 450; // 飛来物が塔から出て止まるまでの時間（400 未満にはしない。目で追えずワープに見えるため）
   const FREEZE_Z = 0.6; // 時間停止時の奥行き（0 = 投げ手の位置、1 = プレイヤーの顔）
-  const ADVANCE_Z = 0.85; // 再生中に迎撃されなかった飛来物が近づく奥行き
-  const IMPACT_STAGGER_MS = 170; // 被弾の間隔
-  const IMPACT_MS = 220; // 被弾ひとつの飛び込み時間
+  // 迎撃をうち漏らした飛来物は、再生（時間の再開）と並行して飛んでくる。再生開始から「並び順 × MISS_STAGGER_MS」遅れて飛び始め、
+  // MISS_FLY_MS かけて顔（z = 1.35）まで加速しながら飛ぶ。吹っ飛びの見せ場（replayPause）で拳の再生が止まっている間も飛び続ける
+  const MISS_STAGGER_MS = 40; // 漏れた飛来物が飛び始める間隔
+  const MISS_FLY_MS = 240; // 漏れた飛来物ひとつの飛び込み時間
+  const MISS_HIT_Z = 1.35; // 被弾する奥行き（1 = プレイヤーの顔を少し通り過ぎた所）
   const BETWEEN_MS = 100; // ターンの間の息つぎ（ほぼ無し。着地から次の時間停止までの受け身の時間を詰める）
   const WARN_MS = 1000; // 残りこの時間を切ると表示色が変わる
   const RESULT_DELAY_MS = 1500; // 決着から結果の箱を出すまで
@@ -141,6 +143,7 @@
   }
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
   const lerp = (a, b, t) => a + (b - a) * t;
+  const easeIn = (t) => t * t;
   const easeOut = (t) => 1 - (1 - t) * (1 - t);
   const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t));
 
@@ -802,7 +805,8 @@
   // ---- ゲームの状態 ----
   // intro = 戦闘開始の導入。台は空で、塔全体が上から落ちてくる（一番下の段が着地するまで。クリックは受け付けない）
   // finish = 最後の段が吹っ飛び、だるまが台へ落ちるのを待っている（着地で最終段階へ）
-  let phase = 'title'; // title | intro | attack | timestop | replay | finish | impact | between | win | lose
+  // replay = 時間が再開し、予約した拳の再生と、漏れた飛来物の飛び込み（被弾）が並行して進む。両方が終わったらターン終了
+  let phase = 'title'; // title | intro | attack | timestop | replay | finish | between | win | lose
   let turn = 0;
   let battleNo = 0; // 何戦目か（段の丸太の模様のシードに使う。戦いごとに違う丸太にする）
   let segments = []; // 残っている段、下から順 { id, kind, w, hp, maxHp, hits, reserved, color, pattern, cracks, jolt, dispDy, holdUntil, vel, bounce }（reserved = このターンに予約した殴りの数。ターンごとに 0 に戻す）
@@ -824,6 +828,7 @@
   let replayDuration = 0;
   let replayTotal = 0;
   let replayPause = 0; // 吹っ飛びの見せ場のあいだ拳の再生を止める残り時間
+  let missTimer = 0; // 再生開始からの経過（ms）。漏れた飛来物の飛び込みに使う。replayPause の間も止めない（落下も再開した時間の中で起きている）
   let punchCount = 0; // 再生の中で何本目の拳か（手を交互に）
   let resultShown = false;
 
@@ -1032,6 +1037,7 @@
     boomCount = 0;
     fireworksLeft = 0;
     replayPause = 0;
+    missTimer = 0;
     resultShown = false;
     phaseTimer = 0;
     ui.showTitle(false);
@@ -1077,6 +1083,40 @@
     replayPause = 0;
     replayTotal = queue.length;
     replayDuration = Math.max(450, queue.length * PUNCH_INTERVAL_MS + 320);
+    // 漏れた飛来物（印の付いていないもの）は時間の再開と同時に動き出す。並び順に MISS_STAGGER_MS ずつ遅れて飛び始める
+    missTimer = 0;
+    let n = 0;
+    for (const p of projectiles) {
+      if (!p.alive || p.marked) continue;
+      p.hitAt = n * MISS_STAGGER_MS;
+      p.hitDone = false;
+      n += 1;
+    }
+  }
+
+  // 漏れた飛来物を missTimer に沿って飛ばす。到着したら被弾（takeHit）。戻り値は「まだ飛んでいる（または飛び始める前の）ものがあるか」
+  // 自だるまが割れて敗北に移ったら途中で止め、false を返す（呼び元は phase を見て抜ける）
+  function stepMisses(f) {
+    let pending = false;
+    for (const p of projectiles) {
+      if (!p.alive || p.marked) continue;
+      const e = missTimer - p.hitAt;
+      if (e < 0) {
+        pending = true;
+        continue;
+      }
+      const t = clamp(e / MISS_FLY_MS, 0, 1.3);
+      // 時間停止の位置（FREEZE_Z）から顔まで加速して飛ぶ（最後に速くなる）。通り過ぎたあと（t > 1）はそのまま奥へ抜けて消える
+      p.z = lerp(FREEZE_Z, MISS_HIT_Z, t < 1 ? easeIn(t) : t);
+      p.rot += p.spin * 0.06 * f;
+      if (!p.hitDone && t >= 1) {
+        takeHit(p);
+        if (phase !== 'replay') return false;
+      }
+      if (t < 1.3) pending = true;
+      else p.alive = false;
+    }
+    return pending;
   }
 
   function executePunch(i) {
@@ -1235,20 +1275,6 @@
       sound.land(big);
     }
     if (big) enterFinale();
-  }
-
-  function beginImpact() {
-    const left = projectiles.filter((p) => p.alive && !p.marked);
-    if (!left.length) {
-      endTurn();
-      return;
-    }
-    phase = 'impact';
-    phaseTimer = 0;
-    left.forEach((p, i) => {
-      p.hitAt = i * IMPACT_STAGGER_MS;
-      p.hitDone = false;
-    });
   }
 
   function takeHit(p) {
@@ -1566,10 +1592,6 @@
       flash.alpha -= dt / 450;
       if (flash.alpha <= 0) flash = null;
     }
-    if (banner) {
-      banner.age += dt;
-      if (banner.dur && banner.age > banner.dur) banner = null; // 期限つきの見出し（最終段階の合図）は消す
-    }
     playerSquash *= Math.pow(0.001, dt / 260);
     // 勝利の花火と花びら
     if (phase === 'win') {
@@ -1592,6 +1614,11 @@
   // ---- 更新 ----
   function update(dt, now) {
     clock += dt;
+    // 見出しは画面の案内なので、時間停止で凍らせず実時間で進める（最終段階の合図が止まったまま残らないように）
+    if (banner) {
+      banner.age += dt;
+      if (banner.dur && banner.age > banner.dur) banner = null;
+    }
     if (phase !== 'timestop') updateFx(dt);
     const f = dt / 16.67;
 
@@ -1619,8 +1646,10 @@
       }
       if (remain <= 0) beginReplay();
     } else if (phase === 'replay') {
+      // 時間はいっせいに再開する。拳の再生と、漏れた飛来物の飛び込みは並行して進む
+      missTimer += dt;
       if (replayPause > 0) {
-        // 吹っ飛びと落下の見せ場。拳の予定表（phaseTimer）は進めない
+        // 吹っ飛びと落下の見せ場。拳の予定表（phaseTimer）は進めないが、飛来物（missTimer）は飛び続ける
         replayPause -= dt;
       } else {
         phaseTimer += dt;
@@ -1631,38 +1660,14 @@
         }
         if (phase !== 'replay') return;
       }
-      const t = clamp(phaseTimer / replayDuration, 0, 1);
-      for (const p of projectiles) {
-        if (!p.alive || p.marked) continue;
-        p.z = lerp(FREEZE_Z, ADVANCE_Z, t);
-        p.rot += p.spin * 0.02 * f;
-      }
-      if (replayPause <= 0 && replayIdx >= queue.length && phaseTimer >= replayDuration) beginImpact();
+      const pending = stepMisses(f);
+      if (phase !== 'replay') return; // 被弾で自だるまが割れた（敗北）
+      // 拳を打ち切り、漏れた飛来物も全部解決したらターン終了（拳が空でも飛来物が残っていれば待つ）
+      if (replayPause <= 0 && replayIdx >= queue.length && phaseTimer >= replayDuration && !pending) endTurn();
     } else if (phase === 'finish') {
       // だるまが画面の外から台へ落ちてくる（宙に留まる BLOW_MS ＋ 落下 FALL_MS ≒ 0.65 秒）。通常は着地（onLand）で最終段階に入る
       phaseTimer += dt;
       if (phaseTimer > BLOW_MS + FALL_MS + 1500) enterFinale(); // 保険
-    } else if (phase === 'impact') {
-      phaseTimer += dt;
-      let pending = false;
-      for (const p of projectiles) {
-        if (!p.alive || p.marked) continue;
-        const e = phaseTimer - p.hitAt;
-        if (e < 0) {
-          pending = true;
-          continue;
-        }
-        const t = clamp(e / IMPACT_MS, 0, 1.3);
-        p.z = lerp(ADVANCE_Z, 1.35, t);
-        p.rot += p.spin * 0.06 * f;
-        if (!p.hitDone && t >= 1) {
-          takeHit(p);
-          if (phase !== 'impact') return;
-        }
-        if (t < 1.3) pending = true;
-        else p.alive = false;
-      }
-      if (!pending && phaseTimer > 420) endTurn();
     } else if (phase === 'win' || phase === 'lose') {
       phaseTimer += dt;
       if (!resultShown && phaseTimer >= RESULT_DELAY_MS) {
