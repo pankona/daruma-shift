@@ -873,15 +873,35 @@
 
   function spawnProjectiles() {
     const rng = mulberry32(hash3(turn, 7919, 13));
-    const slots = [];
-    for (const x of [90, 290, 480, 670, 870]) for (const y of [60, 262, 470]) slots.push({ x, y });
-    for (let i = slots.length - 1; i > 0; i--) {
-      const j = Math.floor(rng() * (i + 1));
-      const tmp = slots[i];
-      slots[i] = slots[j];
-      slots[j] = tmp;
+    // 出現位置は「塔の内側」と「塔の外側（左右の余白）」に分けて引く。
+    // 毎ターン、外側にもおおよそ半分が散る形にして、迎撃（左右）と攻撃（中央）の場所を分ける。
+    const inSlots = [];
+    const outSlots = [];
+    for (const x of [90, 290, 480, 670, 870]) for (const y of [60, 262, 470]) {
+      if (x < 170 || x > 790) outSlots.push({ x, y });
+      else inSlots.push({ x, y });
     }
+    const shuffle = (arr) => {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1));
+        const tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+      }
+    };
+    shuffle(outSlots);
+    shuffle(inSlots);
     const k = projectileCount(turn);
+    const outCount = Math.min(outSlots.length, Math.ceil(k / 2));
+    const slots = outSlots.slice(0, outCount)
+      .concat(inSlots.slice(0, k - outCount));
+    if (slots.length < k) {
+      const rest = inSlots.slice(k - outCount).concat(outSlots.slice(outCount));
+      for (const s of rest) {
+        if (slots.length >= k) break;
+        slots.push(s);
+      }
+    }
     const dg = darumaGeom();
     projectiles = [];
     for (let i = 0; i < k; i++) {
