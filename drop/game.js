@@ -29,7 +29,7 @@
     { kind: 'fragile', w: 620, hp: 5, maxHp: 5, tone: null },
     { kind: 'fragile', w: 380, hp: 4, maxHp: 5, tone: 'light' },
     { kind: 'fragile', w: 700, hp: 7, maxHp: 7, tone: 'dark' },
-    { kind: 'hard', w: 620, hp: 9, maxHp: 9, tone: null },
+    { kind: 'hard', w: 620, hp: 14, maxHp: 14, tone: null },
   ];
   const SEGMENT_COUNT = LEVEL.length; // 段の数（4）
   const SEG_W_MAX = Math.max(...LEVEL.map((l) => l.w)); // 最も太い段の幅（700）。弧のはみ出しの上限や模様の焼き幅の見込みに使う
