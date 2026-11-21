@@ -23,14 +23,18 @@
   //  1 段目：脆い木、幅 620、5 打
   //  2 段目：脆い木（細い）、幅 380、maxHp 5 に対して hp 4 で始める（最初から 1 打分のヒビが入った「少し弱っている」段）。色味は明るいほう
   //  3 段目：脆い木（太い）、幅 700、7 打。色味は濃いほうに固定
-  //  4 段目：硬い石、幅 620、10 打
+  //  4 段目：硬い石、幅 620、12 打。1 ターンに予約できる殴りは maxHp の半分（切り上げ、6）まで。上限を超えたクリックは弾かれる（予約にならない）
   // tone: 'light' = 明るい樹皮（LOG_BASE_WARM）に固定、'dark' = 濃い樹皮（LOG_BASE_GRAY）に固定、null = 段ごとの乱数で選ぶ（石は使わない）
   const LEVEL = [
     { kind: 'fragile', w: 620, hp: 5, maxHp: 5, tone: null },
     { kind: 'fragile', w: 380, hp: 4, maxHp: 5, tone: 'light' },
     { kind: 'fragile', w: 700, hp: 7, maxHp: 7, tone: 'dark' },
-    { kind: 'hard', w: 620, hp: 14, maxHp: 14, tone: null },
+    { kind: 'hard', w: 620, hp: 12, maxHp: 12, tone: null },
   ];
+  // 硬い段の 1 ターンの予約上限（maxHp の半分、切り上げ）。木の段は上限なし（null）
+  function segReserveCap(seg) {
+    return seg.kind === 'hard' ? Math.ceil(seg.maxHp / 2) : null;
+  }
   const SEGMENT_COUNT = LEVEL.length; // 段の数（4）
   const SEG_W_MAX = Math.max(...LEVEL.map((l) => l.w)); // 最も太い段の幅（700）。弧のはみ出しの上限や模様の焼き幅の見込みに使う
   const DARUMA_HP = 12; // 最終段階で敵だるま本体が破裂するまでの打数
@@ -723,6 +727,16 @@
         sweep(t, 0.2, 0.3, 700, 2600);
         hiss(t + 0.02, 0.05, 0.1, 'highpass', 3000, 1);
       },
+      // 弾かれた予約：鈍い金属音。少しずれた倍音を重ねた短い響きに、低い芯と硬い当たりを足す
+      clang() {
+        if (!live()) return;
+        const t = ac.currentTime;
+        tone(430, 410, t, 0.16, 0.2, 'triangle');
+        tone(1150, 1100, t, 0.1, 0.07, 'sine');
+        tone(1720, 1660, t, 0.06, 0.04, 'sine');
+        tone(130, 85, t, 0.08, 0.16, 'sine');
+        hiss(t, 0.025, 0.16, 'bandpass', 2800, 3);
+      },
       // 予約の印を付ける小さな音
       mark() {
         if (!live()) return;
@@ -791,7 +805,7 @@
   let phase = 'title'; // title | intro | attack | timestop | replay | finish | impact | between | win | lose
   let turn = 0;
   let battleNo = 0; // 何戦目か（段の丸太の模様のシードに使う。戦いごとに違う丸太にする）
-  let segments = []; // 残っている段、下から順 { id, kind, w, hp, maxHp, hits, color, pattern, cracks, jolt, dispDy, holdUntil, vel, bounce }
+  let segments = []; // 残っている段、下から順 { id, kind, w, hp, maxHp, hits, reserved, color, pattern, cracks, jolt, dispDy, holdUntil, vel, bounce }（reserved = このターンに予約した殴りの数。ターンごとに 0 に戻す）
   let removed = 0; // 吹っ飛ばした段の数
   let finale = false; // 最終段階（だるまが台の上にいて、本体を殴れる）
   let darumaHits = 0; // 最終段階で本体に入れた打数
@@ -821,6 +835,8 @@
   const puffs = []; // 土煙 { x, y, vx, vy, r, age, dur }
   const lastPunch = [null, null]; // 手ごとの直近の拳 { tx, ty, start }
   const whiffs = [null, null]; // 手ごとの届かない拳 { tx, ty, reach, start }。時間停止中に動くので lastPunch とは別に持つ
+  const rejects = []; // 弾かれた予約の火花 { x, y, start, seed }。時間停止中に動くので clock で進め、色調の加工の上に描く（shards とは別）
+  const REJECT_MS = 260; // 弾かれの火花が消えるまで
   const trails = []; // 残像 { hand, x, y, s, age }
   const impacts = []; // 衝撃 { x, y, age, dur, size, color }
   const shards = []; // 破片 { x, y, vx, vy, rot, vr, age, dur, color, w, h }
@@ -968,6 +984,7 @@
         hp: def.hp,
         maxHp: def.maxHp,
         hits,
+        reserved: 0,
         color: kind === 'hard' ? HARD_COLOR : pattern.base, // 脆い段の色は模様のベース色相（破片の色にも使う）
         pattern,
         cracks,
@@ -1007,6 +1024,7 @@
     bursts.length = 0;
     lastPunch[0] = lastPunch[1] = null;
     whiffs[0] = whiffs[1] = null;
+    rejects.length = 0;
     shakeMs = shakeAmp = 0;
     flash = null;
     banner = null;
@@ -1035,6 +1053,7 @@
     queue = [];
     marks = [];
     punchCount = 0;
+    for (const s of segments) s.reserved = 0; // 予約の上限はターンごとに数え直す
     spawnProjectiles();
     daruma.lunge = 1;
   }
@@ -1327,6 +1346,8 @@
   // 時間停止中のクリック。飛来物 → 迎撃の予約、段 → その段を殴る予約（段のどこでも同じ）。
   // だるま本体は最終段階（段が全部なくなって台に落ちた後）だけ予約できる。段が残っている間に見えているだるまを叩くと、
   // 予約は入らず「拳が届かない」空振りの反応だけ出る。何もない所は予約しない。
+  // 硬い段は 1 ターンに予約できる殴りに上限がある（segReserveCap）。上限に達した段へのクリックは予約にならず、
+  // 弾かれる反応（金属質の火花と鈍い金属音）だけを返す（星印は出さず、キューにも積まない）。
   // 画面の外（塔の上の、まだ降りていない段など）はクリックできない。実入力とテスト用フックの両方がここを通る
   function handleClick(x, y) {
     if (phase !== 'timestop') return null;
@@ -1353,7 +1374,14 @@
     for (let i = segments.length - 1; i >= 0; i--) {
       const r = segRect(i);
       if (x < r.x || x >= r.x + r.w || y < r.y || y >= r.y + r.h) continue;
-      queue.push({ type: 'seg', id: segments[i].id });
+      const seg = segments[i];
+      const cap = segReserveCap(seg);
+      if (cap !== null && seg.reserved >= cap) {
+        startReject(x, y);
+        return 'reject';
+      }
+      seg.reserved += 1;
+      queue.push({ type: 'seg', id: seg.id });
       marks.push({ x, y, kind: 'seg' });
       sound.mark();
       return 'seg';
@@ -1386,6 +1414,12 @@
     const reach = clamp((rest.y - stopY) / Math.max(1, rest.y - y), 0.35, 0.8);
     whiffs[hand] = { tx: x, ty: y, reach, start: clock };
     sound.whiff();
+  }
+
+  // 弾かれた予約。クリック位置に小さな金属質の火花を散らし、鈍い金属音を鳴らす。予約もキューも増えない
+  function startReject(x, y) {
+    rejects.push({ x, y, start: clock, seed: Math.random() * TAU });
+    sound.clang();
   }
 
   // ---- 演出の部品 ----
@@ -2497,6 +2531,45 @@
     ctx.restore();
   }
 
+  // 弾かれの火花。点から鋼色の短い筋が放射状に伸びて消える。clock で進めるので時間停止中も動く。消えた分はここで捨てる
+  function drawRejects(ctx) {
+    for (let i = rejects.length - 1; i >= 0; i--) {
+      const rj = rejects[i];
+      const e = clock - rj.start;
+      if (e >= REJECT_MS) {
+        rejects.splice(i, 1);
+        continue;
+      }
+      const t = e / REJECT_MS;
+      const reach = easeOut(t);
+      const alpha = 1 - t * t;
+      ctx.save();
+      ctx.translate(rj.x, rj.y);
+      ctx.globalAlpha = alpha;
+      ctx.lineCap = 'round';
+      const n = 7;
+      for (let k = 0; k < n; k++) {
+        const a = rj.seed + (k * TAU) / n + (k % 2 ? 0.25 : 0);
+        const len = (k % 2 ? 11 : 17) * reach;
+        const r0 = 3 + 9 * reach;
+        ctx.strokeStyle = k % 3 ? '#dfe6ee' : '#9fb0c0';
+        ctx.lineWidth = k % 2 ? 1.5 : 2.2;
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(a) * r0, Math.sin(a) * r0);
+        ctx.lineTo(Math.cos(a) * (r0 + len), Math.sin(a) * (r0 + len));
+        ctx.stroke();
+      }
+      // 当たりの小さな白い芯。すぐ縮んで消える
+      if (t < 0.4) {
+        ctx.fillStyle = WA.shiro;
+        ctx.beginPath();
+        ctx.arc(0, 0, 4 * (1 - t / 0.4), 0, TAU);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+  }
+
   function drawCountdown(ctx, now) {
     const remain = Math.max(0, TIMESTOP_MS - (now - stopStart));
     const warn = remain <= WARN_MS;
@@ -2651,6 +2724,7 @@
       drawMarks(ctx);
       drawCountdown(ctx, now);
     }
+    if (rejects.length) drawRejects(ctx); // 色調の加工の上に描く（時間停止中に出るので、普通の色で見える）
 
     if (flash) {
       ctx.fillStyle = `rgba(${flash.color}, ${clamp(flash.alpha, 0, 1)})`;
@@ -2735,7 +2809,8 @@
         playerHits,
         segments: segments.map((s, i) => {
           const r = segRect(i);
-          return { x: r.x, y: r.y, w: r.w, h: r.h, kind: s.kind, hp: s.hp, maxHp: s.maxHp };
+          // reserveCap = このターンに予約できる殴りの上限（木の段は null）、reserved = このターンに予約済みの回数
+          return { x: r.x, y: r.y, w: r.w, h: r.h, kind: s.kind, hp: s.hp, maxHp: s.maxHp, reserveCap: segReserveCap(s), reserved: s.reserved };
         }),
         darumaRect: darumaRect(),
         removed,
