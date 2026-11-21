@@ -187,6 +187,31 @@
   };
   darumaImage.src = '../assets/daruma.png';
 
+  // ---- 段の質感の素材（描き出し画像）----
+  // 木（kind 'fragile'）と石（kind 'hard'）の側面の質感。どちらも正面から均一な照明で描き出したもので、左右の陰影は含まない（陰影はゲーム側のグラデーションが付ける）。
+  // 読めるまで、または読み損ねたときは、従来の手続き描画のまま。木は読み終わった時点で、すでに作られている段の模様を焼き直す（最初の戦闘に間に合わなかった場合の保険）
+  const logTexImage = new Image();
+  const stoneTexImage = new Image();
+  let logTexReady = false;
+  let logTexFailed = false;
+  let stoneTexReady = false;
+  let stoneTexFailed = false;
+  logTexImage.onload = function () {
+    logTexReady = true;
+    rebakeLogPatterns();
+  };
+  logTexImage.onerror = function () {
+    logTexFailed = true;
+  };
+  stoneTexImage.onload = function () {
+    stoneTexReady = true; // 石は毎フレーム生描きなので、次の描画から画像に切り替わる
+  };
+  stoneTexImage.onerror = function () {
+    stoneTexFailed = true;
+  };
+  logTexImage.src = 'assets/log-tex-std.jpg';
+  stoneTexImage.src = 'assets/stone-tex-std.jpg';
+
   // ---- だるまの見た目（絵＋ヒビ＋欠け）。絵の中心を原点にした論理座標で扱う ----
   // ヒビは絵の不透明部分にだけ乗せ（source-atop）、欠けは画素を消して背景を見せる（destination-out）。
   function makeDarumaView(artW) {
@@ -418,6 +443,7 @@
     const pat = {
       w, // 段の幅
       R, // 丸太の半径（w / 2）
+      tone, // 色味の指定（描き出し画像を使うとき、'light' / 'dark' は画像の上に薄い色を重ねて差を残す。null は何も重ねない）
       base: tone === 'light' ? LOG_BASE_WARM : tone === 'dark' ? LOG_BASE_GRAY : coin ? LOG_BASE_WARM : LOG_BASE_GRAY, // ベース色相（A 赤み寄り＝明るい / B 灰み寄り＝濃い）
       lightShift: (rng() - 0.5) * 0.06, // 光の帯の位置の揺れ（幅に対する割合、±3%）。光の向きそのものは全段で固定
       blotches: [], // 低周波の色むら（柔らかい縦帯）
@@ -1872,26 +1898,41 @@
   }
 
   // 樹皮の静的な模様を描く（段の中心を原点。範囲は x ∈ [-pat.R, pat.R]、y ∈ [-SEG_H/2 - LOG_TEX_EXT, SEG_H/2 + LOG_TEX_EXT]）。
-  // 順番：ベース → 色むら → 左右の円柱陰影 → 副筋 → 主筋 → 剥がれ → 節 → 苔 → 点描。年輪は側面には描かない（枝の切り株だけ）
+  // 順番：ベース → 色むら → 左右の円柱陰影 → 副筋 → 主筋 → 剥がれ → 節 → 苔 → 点描。年輪は側面には描かない（枝の切り株だけ）。
+  // 描き出し画像（logTexImage）が読めているときは、ベース・色むら・筋・剥がれ・点描の代わりに画像を範囲いっぱいに引き伸ばして貼り、
+  // その上に tone の薄い色 → 左右の円柱陰影を重ねる（画像は均一照明なので陰影はここで付ける）。節と苔は画像に含まれないので現行どおり描く
   function drawBarkTexture(ctx, pat) {
     const R = pat.R;
     const w = pat.w;
     const h = SEG_H;
     const y0 = -h / 2 - LOG_TEX_EXT;
     const th = h + 2 * LOG_TEX_EXT;
-    ctx.fillStyle = pat.base;
-    ctx.fillRect(-R, y0, w, th);
-    // 低周波の色むら：輪郭をぼかした柔らかい縦帯
-    for (const b of pat.blotches) {
-      const g = ctx.createLinearGradient(b.x - b.w / 2, 0, b.x + b.w / 2, 0);
-      const c = b.dark ? LOG_SHADE : LOG_LIGHT;
-      g.addColorStop(0, `rgba(${c}, 0)`);
-      g.addColorStop(0.5, `rgba(${c}, ${b.alpha})`);
-      g.addColorStop(1, `rgba(${c}, 0)`);
-      ctx.fillStyle = g;
-      ctx.fillRect(b.x - b.w / 2, y0, b.w, th);
+    const useImage = logTexReady;
+    if (useImage) {
+      ctx.drawImage(logTexImage, -R, y0, w, th);
+      // 木の色味の差：light は明るい色、dark は暗い色を全面に薄く重ねる。標準（null）は何も重ねない
+      if (pat.tone === 'light') {
+        ctx.fillStyle = 'rgba(255, 238, 205, 0.2)';
+        ctx.fillRect(-R, y0, w, th);
+      } else if (pat.tone === 'dark') {
+        ctx.fillStyle = 'rgba(24, 12, 0, 0.24)';
+        ctx.fillRect(-R, y0, w, th);
+      }
+    } else {
+      ctx.fillStyle = pat.base;
+      ctx.fillRect(-R, y0, w, th);
+      // 低周波の色むら：輪郭をぼかした柔らかい縦帯
+      for (const b of pat.blotches) {
+        const g = ctx.createLinearGradient(b.x - b.w / 2, 0, b.x + b.w / 2, 0);
+        const c = b.dark ? LOG_SHADE : LOG_LIGHT;
+        g.addColorStop(0, `rgba(${c}, 0)`);
+        g.addColorStop(0.5, `rgba(${c}, ${b.alpha})`);
+        g.addColorStop(1, `rgba(${c}, 0)`);
+        ctx.fillStyle = g;
+        ctx.fillRect(b.x - b.w / 2, y0, b.w, th);
+      }
     }
-    // 円柱の陰影（左右方向）。光の帯は中央より少し左（光は左上前）。右をより暗く。段ごとに帯の位置を ±3% 揺らす
+    // 円柱の陰影（左右方向）。光の帯は中央より少し左（光は左上前）。右をより暗く。段ごとに帯の位置を ±3% 揺らす。画像のときも必ず重ねる
     const sh = pat.lightShift;
     const grad = ctx.createLinearGradient(-R, 0, R, 0);
     const stop = (f, c, a) => grad.addColorStop(clamp(f + 0.5 + sh, 0, 1), `rgba(${c}, ${a})`);
@@ -1904,54 +1945,57 @@
     grad.addColorStop(1, `rgba(${LOG_SHADE}, 0.5)`);
     ctx.fillStyle = grad;
     ctx.fillRect(-R, y0, w, th);
-    // 副筋
-    for (const s of pat.subs) {
-      ctx.fillStyle = `rgba(${s.light ? LOG_BARK_LIGHT : LOG_BARK_DARK}, ${s.alpha})`;
-      fillRibbon(ctx, s.pts, s.width / 2, true, true);
-    }
-    // 主筋：溝として読ませるため、筋の左側に細い明線を添える。途切れの端だけ細く消し、筋そのものの端（模様の端＝縁の弧で切り落とす、合流の先）は細らせない
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    for (const s of pat.streaks) {
-      for (const run of s.runs) {
-        const taperStart = run[0].y > s.yMin + 1;
-        const taperEnd = run[run.length - 1].y < s.yMax - 1;
-        ctx.fillStyle = `rgba(${LOG_BARK_DARK}, ${s.alpha})`;
-        fillRibbon(ctx, run, s.width / 2, taperStart, taperEnd);
-        ctx.strokeStyle = `rgba(${LOG_BARK_LIGHT}, 0.18)`;
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        for (let i = 0; i < run.length; i++) {
-          const p = run[i];
-          if (i === 0) ctx.moveTo(p.x - s.width / 2 - 0.8, p.y);
-          else ctx.lineTo(p.x - s.width / 2 - 0.8, p.y);
+    // 副筋・主筋・剥がれは手続き描画のときだけ（画像には樹皮の筋が描き込まれている）
+    if (!useImage) {
+      // 副筋
+      for (const s of pat.subs) {
+        ctx.fillStyle = `rgba(${s.light ? LOG_BARK_LIGHT : LOG_BARK_DARK}, ${s.alpha})`;
+        fillRibbon(ctx, s.pts, s.width / 2, true, true);
+      }
+      // 主筋：溝として読ませるため、筋の左側に細い明線を添える。途切れの端だけ細く消し、筋そのものの端（模様の端＝縁の弧で切り落とす、合流の先）は細らせない
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (const s of pat.streaks) {
+        for (const run of s.runs) {
+          const taperStart = run[0].y > s.yMin + 1;
+          const taperEnd = run[run.length - 1].y < s.yMax - 1;
+          ctx.fillStyle = `rgba(${LOG_BARK_DARK}, ${s.alpha})`;
+          fillRibbon(ctx, run, s.width / 2, taperStart, taperEnd);
+          ctx.strokeStyle = `rgba(${LOG_BARK_LIGHT}, 0.18)`;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          for (let i = 0; i < run.length; i++) {
+            const p = run[i];
+            if (i === 0) ctx.moveTo(p.x - s.width / 2 - 0.8, p.y);
+            else ctx.lineTo(p.x - s.width / 2 - 0.8, p.y);
+          }
+          ctx.stroke();
         }
+      }
+      // 剥がれ：少し明るい縦帯。右側に暗い影線、上下の端は細く割れて尖る
+      for (const p of pat.peels) {
+        const xa = p.x - p.w / 2;
+        const xb = p.x + p.w / 2;
+        const ya = p.y - p.h / 2;
+        const yb = p.y + p.h / 2;
+        ctx.fillStyle = `rgba(${LOG_LIGHT}, 0.12)`;
+        ctx.beginPath();
+        ctx.moveTo(xa, ya + p.tip);
+        ctx.lineTo(xa + p.w * 0.35, ya);
+        ctx.lineTo(xb, ya + p.tip * 1.3);
+        ctx.lineTo(xb, yb - p.tip * 0.7);
+        ctx.lineTo(xb - p.w * 0.4, yb);
+        ctx.lineTo(xa, yb - p.tip);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = `rgba(${LOG_SHADE}, 0.4)`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(xb, ya + p.tip * 1.3);
+        ctx.lineTo(xb, yb - p.tip * 0.7);
+        ctx.lineTo(xb - p.w * 0.4, yb);
         ctx.stroke();
       }
-    }
-    // 剥がれ：少し明るい縦帯。右側に暗い影線、上下の端は細く割れて尖る
-    for (const p of pat.peels) {
-      const xa = p.x - p.w / 2;
-      const xb = p.x + p.w / 2;
-      const ya = p.y - p.h / 2;
-      const yb = p.y + p.h / 2;
-      ctx.fillStyle = `rgba(${LOG_LIGHT}, 0.12)`;
-      ctx.beginPath();
-      ctx.moveTo(xa, ya + p.tip);
-      ctx.lineTo(xa + p.w * 0.35, ya);
-      ctx.lineTo(xb, ya + p.tip * 1.3);
-      ctx.lineTo(xb, yb - p.tip * 0.7);
-      ctx.lineTo(xb - p.w * 0.4, yb);
-      ctx.lineTo(xa, yb - p.tip);
-      ctx.closePath();
-      ctx.fill();
-      ctx.strokeStyle = `rgba(${LOG_SHADE}, 0.4)`;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(xb, ya + p.tip * 1.3);
-      ctx.lineTo(xb, yb - p.tip * 0.7);
-      ctx.lineTo(xb - p.w * 0.4, yb);
-      ctx.stroke();
     }
     // 節
     for (const k of pat.knots) {
@@ -2040,7 +2084,8 @@
       ctx.ellipse(m.x, m.y, m.rx, m.ry, 0, 0, TAU);
       ctx.fill();
     }
-    // 点描（ざらつき）：暗・明半々。数は段の幅に比例させる（基準の幅 620 で 480〜540）
+    // 点描（ざらつき）：暗・明半々。数は段の幅に比例させる（基準の幅 620 で 480〜540）。画像のときは画像のざらつきに任せる
+    if (useImage) return;
     const srng = mulberry32(pat.stippleSeed);
     const n = Math.round((480 + Math.floor(srng() * 60)) * (w / SEG_W));
     for (let i = 0; i < n; i++) {
@@ -2048,6 +2093,15 @@
       const y = y0 + srng() * th;
       ctx.fillStyle = srng() < 0.5 ? `rgba(${LOG_SHADE}, 0.07)` : `rgba(${LOG_LIGHT}, 0.07)`;
       ctx.fillRect(x, y, 1.5, 1.5);
+    }
+  }
+
+  // 木の描き出し画像が読み終わったときに、すでにある段（塔の段と吹っ飛び中の段）の焼いた模様を捨てて、次の描画で焼き直させる
+  function rebakeLogPatterns() {
+    for (const list of [segments, blowing]) {
+      for (const s of list) {
+        if (s.pattern) s.pattern.texK = 0;
+      }
     }
   }
 
@@ -2205,19 +2259,24 @@
     ctx.fill();
     ctx.save();
     ctx.clip();
+    // 石の肌：描き出し画像が読めていれば、木の模様と同じ縦の範囲（段の箱の上下 LOG_TEX_EXT まで）に引き伸ばして貼る（画像の縦横比を木と揃えるため。はみ出す分は clip で落ちる）。
+    // 画像は均一照明なので、上面の光と下の影はこの後で現行どおり重ねる
+    if (stoneTexReady) ctx.drawImage(stoneTexImage, -w / 2, -h / 2 - LOG_TEX_EXT, w, h + 2 * LOG_TEX_EXT);
     // 上面の光と下の影
     ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
     ctx.fillRect(-w / 2, -h / 2, w, 22);
     ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
     ctx.fillRect(-w / 2, h / 2 - 20, w, 20);
-    // 石の肌：まばらな暗い斑
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.16)';
-    for (let i = 0; i < 24; i++) {
-      const sx = -w / 2 + 40 + ((i * 197) % (w - 80));
-      const sy = -h / 2 + 50 + ((i * 131) % (h - 100));
-      ctx.beginPath();
-      ctx.ellipse(sx, sy, 18 + (i % 3) * 6, 8 + (i % 2) * 4, (i * 0.7) % 1, 0, TAU);
-      ctx.fill();
+    // 石の肌：まばらな暗い斑（画像が読めるまで、または読み損ねたときの手続き描画）
+    if (!stoneTexReady) {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.16)';
+      for (let i = 0; i < 24; i++) {
+        const sx = -w / 2 + 40 + ((i * 197) % (w - 80));
+        const sy = -h / 2 + 50 + ((i * 131) % (h - 100));
+        ctx.beginPath();
+        ctx.ellipse(sx, sy, 18 + (i % 3) * 6, 8 + (i % 2) * 4, (i * 0.7) % 1, 0, TAU);
+        ctx.fill();
+      }
     }
     // 金属の帯：上下に 2 本、鋲を打つ
     for (const by of [-h / 2 + 44, h / 2 - 44]) {
