@@ -212,6 +212,40 @@
   logTexImage.src = 'assets/log-tex-std.jpg';
   stoneTexImage.src = 'assets/stone-tex-std.jpg';
 
+  // ---- 飛来物と拳の素材（描き出し画像、背景透明）----
+  // 木の飛来物（512×176）・石の飛来物（512×512）・赤いボクシンググローブ（512×512。指の関節側が上、親指が右、手首の白い縁が下）。
+  // どれも毎フレーム生描きなので、読み終われば次の描画から画像に切り替わる。読めるまで、または読み損ねたときは、従来のベクター描画のまま
+  const projWoodImage = new Image();
+  const projStoneImage = new Image();
+  const gloveImage = new Image();
+  let projWoodReady = false;
+  let projWoodFailed = false;
+  let projStoneReady = false;
+  let projStoneFailed = false;
+  let gloveReady = false;
+  let gloveFailed = false;
+  projWoodImage.onload = function () {
+    projWoodReady = true;
+  };
+  projWoodImage.onerror = function () {
+    projWoodFailed = true;
+  };
+  projStoneImage.onload = function () {
+    projStoneReady = true;
+  };
+  projStoneImage.onerror = function () {
+    projStoneFailed = true;
+  };
+  gloveImage.onload = function () {
+    gloveReady = true;
+  };
+  gloveImage.onerror = function () {
+    gloveFailed = true;
+  };
+  projWoodImage.src = 'assets/proj-wood.png';
+  projStoneImage.src = 'assets/proj-stone.png';
+  gloveImage.src = 'assets/glove.png';
+
   // ---- だるまの見た目（絵＋ヒビ＋欠け）。絵の中心を原点にした論理座標で扱う ----
   // ヒビは絵の不透明部分にだけ乗せ（source-atop）、欠けは画素を消して背景を見せる（destination-out）。
   function makeDarumaView(artW) {
@@ -2262,6 +2296,20 @@
     // 石の肌：描き出し画像が読めていれば、木の模様と同じ縦の範囲（段の箱の上下 LOG_TEX_EXT まで）に引き伸ばして貼る（画像の縦横比を木と揃えるため。はみ出す分は clip で落ちる）。
     // 画像は均一照明なので、上面の光と下の影はこの後で現行どおり重ねる
     if (stoneTexReady) ctx.drawImage(stoneTexImage, -w / 2, -h / 2 - LOG_TEX_EXT, w, h + 2 * LOG_TEX_EXT);
+    // 石の丸み：丸太（drawBarkTexture）と同じ左右の円柱陰影（暗→明→暗）を重ねる。色・位置・濃さは丸太側に合わせ、帯の位置は揺らさず中央基準。
+    // 横は段の幅いっぱい、縦は質感を貼った範囲いっぱい。画像が無いときも常に重ねる（丸太側の流儀に倣う）
+    {
+      const grad = ctx.createLinearGradient(-w / 2, 0, w / 2, 0);
+      grad.addColorStop(0, `rgba(${LOG_SHADE}, 0.42)`);
+      grad.addColorStop(0.2, `rgba(${LOG_SHADE}, 0.12)`);
+      grad.addColorStop(0.38, `rgba(${LOG_LIGHT}, 0.18)`);
+      grad.addColorStop(0.55, `rgba(${LOG_LIGHT}, 0.06)`);
+      grad.addColorStop(0.8, `rgba(${LOG_SHADE}, 0.12)`);
+      grad.addColorStop(0.92, `rgba(${LOG_SHADE}, 0.3)`);
+      grad.addColorStop(1, `rgba(${LOG_SHADE}, 0.5)`);
+      ctx.fillStyle = grad;
+      ctx.fillRect(-w / 2, -h / 2 - LOG_TEX_EXT, w, h + 2 * LOG_TEX_EXT);
+    }
     // 上面の光と下の影
     ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
     ctx.fillRect(-w / 2, -h / 2, w, 22);
@@ -2419,6 +2467,16 @@
     ctx.translate(pos.x, pos.y);
     ctx.rotate(p.rot);
     ctx.scale(s, s);
+    // 描き出し画像が読めていれば、多角形の代わりに画像を中心に描く（大きさは現行の多角形とほぼ同じ）。回転・拡縮は上の translate / rotate / scale のまま
+    const img = p.kind === 'wood' ? projWoodImage : projStoneImage;
+    const imgReady = p.kind === 'wood' ? projWoodReady && !projWoodFailed : projStoneReady && !projStoneFailed;
+    if (imgReady) {
+      const iw = p.kind === 'wood' ? 74 : 58;
+      const ih = p.kind === 'wood' ? 24 : 55;
+      ctx.drawImage(img, -iw / 2, -ih / 2, iw, ih);
+      ctx.restore();
+      return;
+    }
     ctx.lineWidth = 2.5;
     ctx.strokeStyle = WA.sumi;
     if (p.kind === 'wood') {
@@ -2473,6 +2531,14 @@
     ctx.scale(hand === 0 ? s : -s, s);
     const w = FIST_W;
     const h = FIST_W * 0.86;
+    // 描き出し画像（glove.png）が読めていれば、ベクター描画の代わりに画像を描く。
+    // 横は現行どおり幅 FIST_W、縦は拳の上端（-h/2）から手首の白い縁の下端（y = 70）まで。
+    // 素材は親指が右の絵。左右の反転は上の scale（左手は s、右手は -s）のままなので、現行と同じく親指が内側に来る
+    if (gloveReady && !gloveFailed) {
+      ctx.drawImage(gloveImage, -w / 2, -h / 2, w, 70 + h / 2);
+      ctx.restore();
+      return;
+    }
     ctx.lineWidth = 4;
     ctx.strokeStyle = WA.sumi;
     ctx.fillStyle = '#c8311c';
