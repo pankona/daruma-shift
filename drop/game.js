@@ -2,8 +2,8 @@
 // 主観視点のターン制。段の塔の上に乗った敵だるまが飛来物を投げ、それが途中で止まる。
 // 時間停止の間に「飛来物の迎撃」と「段を殴る」を予約し、まとめて再生する。
 // 段には耐久があり、尽きた段は奥へ吹っ飛んで消え、上の段とだるまは一段分ストンと落ちる（離散。物理計算なし）。
-// 段は一画面に収まるのが実質 1 個という大きさ（620×500）。塔は画面の上端をはるかに超え、敵だるまは最後の段が抜けるまで
-// 完全に画面の外にいる。段を吹っ飛ばすたびに次の巨大な段が上から落ちてくる。
+// 段は一画面に収まるのが実質 1 個という大きさ（高さ 500。幅は段ごとに 380〜700）。塔は画面の上端をはるかに超え、敵だるまは最後の段が抜けるまで
+// 完全に画面の外にいる。段を吹っ飛ばすたびに次の巨大な段が上から落ちてくる。段の構成（幅・耐久・種類）は LEVEL で持つ。
 // 最後の段を吹っ飛ばすとだるまが画面の上から落ちてきて台に着地し、最終段階として本体を殴れるようになる。耐久が尽きたら破裂して勝ち。
 // 戦闘開始の導入：台は空で、塔全体が画面の上から落ちてきて一番下の段が台に着地する（段が吹っ飛んだあとの落下と同じ重さ）。
 // 脆い段は縦に積んだ丸太の輪切りとしてコードで描く。主観視点では静止中の段は樹皮の側面しか見えない（上面は画面の上、底面は台や下の段に接している）ので、
@@ -18,24 +18,33 @@
   const H = 540;
   const TIMESTOP_MS = 4000; // 時間停止フェイズの長さ（実時間）
   const PUNCH_INTERVAL_MS = 60; // 再生フェイズで拳を繰り出す間隔
-  // 段の種類。脆い段 = 明るい木、硬い段 = 暗い石に金属の帯。耐久の数字は画面に出さず、色で硬さを読ませる
-  const SEG_HP_FRAGILE = 5; // 脆い段の耐久（この打数で吹っ飛ぶ）
-  const SEG_HP_HARD = 10; // 硬い段の耐久
-  // 今回の面の構成（下から順）。硬い段は種類だけ用意し、今はまだ置かない
-  const LEVEL_KINDS = ['fragile', 'fragile', 'fragile', 'fragile'];
-  const SEGMENT_COUNT = LEVEL_KINDS.length; // 段の数（4）
+  // 段の種類。脆い段 = 明るい木、硬い段 = 暗い石に金属の帯。耐久の数字は画面に出さず、色と幅で硬さを読ませる
+  // 今回の面の構成（下から順＝最初に戦う段から）。段ごとに幅 w・初期 hp・maxHp・種類・色味を持つ。
+  //  1 段目：脆い木、幅 620、5 打
+  //  2 段目：脆い木（細い）、幅 380、maxHp 5 に対して hp 4 で始める（最初から 1 打分のヒビが入った「少し弱っている」段）。色味は明るいほう
+  //  3 段目：脆い木（太い）、幅 700、7 打。色味は濃いほうに固定
+  //  4 段目：硬い石、幅 620、10 打
+  // tone: 'light' = 明るい樹皮（LOG_BASE_WARM）に固定、'dark' = 濃い樹皮（LOG_BASE_GRAY）に固定、null = 段ごとの乱数で選ぶ（石は使わない）
+  const LEVEL = [
+    { kind: 'fragile', w: 620, hp: 5, maxHp: 5, tone: null },
+    { kind: 'fragile', w: 380, hp: 4, maxHp: 5, tone: 'light' },
+    { kind: 'fragile', w: 700, hp: 7, maxHp: 7, tone: 'dark' },
+    { kind: 'hard', w: 620, hp: 9, maxHp: 9, tone: null },
+  ];
+  const SEGMENT_COUNT = LEVEL.length; // 段の数（4）
+  const SEG_W_MAX = Math.max(...LEVEL.map((l) => l.w)); // 最も太い段の幅（700）。弧のはみ出しの上限や模様の焼き幅の見込みに使う
   const DARUMA_HP = 12; // 最終段階で敵だるま本体が破裂するまでの打数
   const PLAYER_HP = 6; // 自だるまが砕けるまでの被弾数
   // 飛来物の数 = min(PROJ_MAX, PROJ_BASE + floor(ターン × PROJ_TURN_NUM / PROJ_TURN_DEN))（ora と同じ）
   const PROJ_BASE = 4;
-  const PROJ_MAX = 10;
+  const PROJ_MAX = 9;
   const PROJ_TURN_NUM = 2;
   const PROJ_TURN_DEN = 3;
 
-  const SEG_W = 620; // 段の幅（画面中央）
-  const SEG_H = 500; // 段の高さ（落下・吹っ飛びの距離はすべてここから導く）。一番下の段は台の上面から y = -30 まで届き、見える段は実質 1 個
+  const SEG_W = 620; // 段の基準の幅（1 段目と最上段の石がこの幅）。段ごとの実際の幅は LEVEL の w で持ち、生成・描画・判定はすべて段自身の w を使う
+  const SEG_H = 500; // 段の高さ（全段共通。落下・吹っ飛びの距離はすべてここから導く）。一番下の段は台の上面から y = -30 まで届き、見える段は実質 1 個
   const TABLE_Y = 470; // 台の上面
-  const TABLE_W = 680; // 台の幅（段の幅 620 に釣り合わせる）
+  const TABLE_W = 680; // 台の幅（基準の段の幅 620 に釣り合わせる。太い段 700 は左右に 10px ずつはみ出すが、わずかなので許容）
   const CENTER_X = 480; // 塔の中心
   // 敵だるまの絵の幅（透明部分を除いた絵の幅）。塔の高さ SEG_H × SEGMENT_COUNT = 2000 なので、だるまは最後の段が抜けるまで
   // 完全に画面の外。最後の段が吹っ飛ぶと、画面の上端の外（足元 y = -30）から台まで 500 落ちてきて着地する
@@ -50,11 +59,11 @@
   // 段の色。脆い段は明るい木（丸太の樹皮）、硬い段は暗い石の色。いずれも和風の落ち着いた色味
   const HARD_COLOR = '#575b63';
   const HARD_BAND = '#aaa49a'; // 硬い段の金属の帯
-  // 丸太（輪切り）の描き込み
-  const SEG_R = SEG_W / 2; // 丸太の半径（画面上の幅の半分）
+  // 丸太（輪切り）の描き込み。丸太の半径 R は段ごとに w / 2（段の幅が違うので定数にしない）
   const HORIZON_Y = 440; // 主観視点の水平線（drawBackground の壁と床の境と同じ高さ）。輪切りの縁の弧はここからの距離で膨らむ
-  const ARC_MAX = SEG_R * 0.35; // 縁の弧の膨らみの上限
-  const LOG_TEX_EXT = 112.5; // 模様を段の箱より上下に広く焼く分（弧がはみ出す上限 ARC_MAX ぶん。筋の刻み LOG_STEP で割り切れる値）
+  const ARC_RATIO = 0.35; // 縁の弧の膨らみの上限（半径に対する割合）
+  const ARC_MAX = (SEG_W_MAX / 2) * ARC_RATIO; // 最も太い段での膨らみの上限（122.5）。画面の外の段を描かない判定に使う
+  const LOG_TEX_EXT = 125; // 模様を段の箱より上下に広く焼く分（最も太い段の弧のはみ出し ARC_MAX = 122.5 を覆う。高さ 500 と合わせて筋の刻み LOG_STEP で割り切れる値）
   const LOG_STEP = 5; // 樹皮の筋を折れ線にする刻み（px）
   const LOG_BASE_WARM = '#c89a62'; // 樹皮のベース色（赤み寄り）
   const LOG_BASE_GRAY = '#b89770'; // 樹皮のベース色（灰み寄り）
@@ -72,21 +81,21 @@
 
   // 戦闘開始の導入（塔が上から落ちてくる）
   const INTRO_HOLD_MS = 350; // 開始から塔が落ち始めるまで（台が空なのを見せる間）
-  const INTRO_LAND_PAUSE_MS = 700; // 一番下の段が着地してから第 1 ターンの攻撃までの間
+  const INTRO_LAND_PAUSE_MS = 350; // 一番下の段が着地してから第 1 ターンの攻撃までの間
 
-  const BLOW_MS = 480; // 段が奥へ吸い込まれて消えるまで（巨大な段なので少し長く）
-  const FALL_MS = 500; // 一段分（SEG_H）を落ち切るまでの目安。約 500ms かけて加速して落ちる
+  const BLOW_MS = 350; // 段が奥へ吸い込まれて消えるまで
+  const FALL_MS = 300; // 一段分（SEG_H）を落ち切るまでの目安。約 300ms かけて加速して落ちる（落ち始めが遅く、着地直前に最速）
   const FALL_G = (2 * SEG_H) / (FALL_MS * FALL_MS); // 落下の加速（px/ms²）。静止から FALL_MS で SEG_H 落ちる
   const BOUNCE_MS = 220; // 着地の縮み（重い段なので跳ねずに潰れる）
-  const BLOW_PAUSE_MS = 1100; // 吹っ飛びのあと、拳の再生を止めて見せ場を読ませる時間（吹っ飛び BLOW_MS ＋ 落下 FALL_MS ＋ 着地）
+  const BLOW_PAUSE_MS = 800; // 吹っ飛びのあと、拳の再生を止めて見せ場を読ませる時間（吹っ飛び BLOW_MS ＋ 落下 FALL_MS ＋ 着地）
   const VANISH_Y = 140; // 吹っ飛ぶ段が吸い込まれる一点の高さ（x は塔の中心）
 
-  const ATTACK_MS = 750; // 飛来物が塔から出て止まるまでの時間
+  const ATTACK_MS = 450; // 飛来物が塔から出て止まるまでの時間（400 未満にはしない。目で追えずワープに見えるため）
   const FREEZE_Z = 0.6; // 時間停止時の奥行き（0 = 投げ手の位置、1 = プレイヤーの顔）
   const ADVANCE_Z = 0.85; // 再生中に迎撃されなかった飛来物が近づく奥行き
   const IMPACT_STAGGER_MS = 170; // 被弾の間隔
   const IMPACT_MS = 220; // 被弾ひとつの飛び込み時間
-  const BETWEEN_MS = 650; // ターンの間の息つぎ
+  const BETWEEN_MS = 100; // ターンの間の息つぎ（ほぼ無し。着地から次の時間停止までの受け身の時間を詰める）
   const WARN_MS = 1000; // 残りこの時間を切ると表示色が変わる
   const RESULT_DELAY_MS = 1500; // 決着から結果の箱を出すまで
   const CRACK_REF_W = 380; // だるまのヒビの大きさの基準（ora の敵だるまの幅）
@@ -357,12 +366,12 @@
     return a + s * (CRACK_VERT_AVOID - Math.abs(d));
   }
 
-  // 段のヒビ。段の番号と何打目かから決定的に作る（段の中心を原点にした座標）。
-  // 巨大な段（620×500）の全面に散らし、枝の長さは SEG_CRACK_SCALE で広げる（100〜250px ほど）。少し横に走りやすくし、
+  // 段のヒビ。段の番号と何打目かから決定的に作る（段の中心を原点にした座標）。w はその段の幅。
+  // 巨大な段（w×500）の全面に散らし、枝の長さは SEG_CRACK_SCALE で広げる（100〜250px ほど）。少し横に走りやすくし、
   // さらに枝の向きを真縦 ±20° から外す（縦の樹皮の筋と重ならないように）
-  function generateSegCrack(segId, n) {
+  function generateSegCrack(segId, n, w) {
     const rng = mulberry32(hash3(segId, n, 101));
-    const x = (rng() - 0.5) * (SEG_W - 180);
+    const x = (rng() - 0.5) * (w - 180);
     const y = (rng() - 0.5) * (SEG_H - 160);
     const branches = [];
     const nb = 2 + Math.floor(rng() * 3);
@@ -388,16 +397,21 @@
 
   // 丸太（輪切り）の模様。段の生成時にシードから一度だけ作って段に持たせる（戦闘中の再描画で模様が変わらないように）。
   // 段の中心を原点にした座標。模様は段の箱より上下に LOG_TEX_EXT だけ広く作る（上下の縁の弧がはみ出す分を埋めるため）。
-  // 静的な部分は barkTexture() でオフスクリーンへ一度焼いて pat.tex に持つ
-  function makeLogPattern(seed) {
+  // 静的な部分は barkTexture() でオフスクリーンへ一度焼いて pat.tex に持つ。
+  // w はその段の幅（模様の横の範囲と筋の本数がこれで決まる）。tone は色味の指定（'light' / 'dark' / null = 乱数）
+  function makeLogPattern(seed, w, tone) {
     const rng = mulberry32(seed);
-    const R = SEG_R;
+    const R = w / 2;
     const h = SEG_H;
     const y0 = -h / 2 - LOG_TEX_EXT;
     const y1 = h / 2 + LOG_TEX_EXT;
     const pick = (a, b) => a + rng() * (b - a);
+    const coin = rng() < 0.5; // 色味の乱数は tone 指定があっても 1 回引いておく（以降の乱数列を揃えるため）
+    const dens = w / SEG_W; // 幅に応じた密度の倍率（副筋と点描の数を基準の幅に対して増減し、細い段が詰まりすぎないようにする）
     const pat = {
-      base: rng() < 0.5 ? LOG_BASE_WARM : LOG_BASE_GRAY, // ベース色相（A 赤み寄り / B 灰み寄り）
+      w, // 段の幅
+      R, // 丸太の半径（w / 2）
+      base: tone === 'light' ? LOG_BASE_WARM : tone === 'dark' ? LOG_BASE_GRAY : coin ? LOG_BASE_WARM : LOG_BASE_GRAY, // ベース色相（A 赤み寄り＝明るい / B 灰み寄り＝濃い）
       lightShift: (rng() - 0.5) * 0.06, // 光の帯の位置の揺れ（幅に対する割合、±3%）。光の向きそのものは全段で固定
       blotches: [], // 低周波の色むら（柔らかい縦帯）
       knots: [], // 節（生きた節 = 縦長のアーモンド、枝の切り株 = 円。筋はこの周りを迂回する）
@@ -518,7 +532,7 @@
       s.pts = null;
     }
     // 副筋：主筋の間を埋める細い波線。長さは全高の 30〜70%。暗 7 割・明 3 割
-    const nsub = 25 + Math.floor(rng() * 11);
+    const nsub = Math.round((25 + Math.floor(rng() * 11)) * dens);
     for (let i = 0; i < nsub; i++) {
       const len = h * pick(0.3, 0.7);
       const ya = pick(y0, y1 - len);
@@ -777,7 +791,7 @@
   let phase = 'title'; // title | intro | attack | timestop | replay | finish | impact | between | win | lose
   let turn = 0;
   let battleNo = 0; // 何戦目か（段の丸太の模様のシードに使う。戦いごとに違う丸太にする）
-  let segments = []; // 残っている段、下から順 { id, kind, hp, maxHp, hits, color, pattern, cracks, jolt, dispDy, holdUntil, vel, bounce }
+  let segments = []; // 残っている段、下から順 { id, kind, w, hp, maxHp, hits, color, pattern, cracks, jolt, dispDy, holdUntil, vel, bounce }
   let removed = 0; // 吹っ飛ばした段の数
   let finale = false; // 最終段階（だるまが台の上にいて、本体を殴れる）
   let darumaHits = 0; // 最終段階で本体に入れた打数
@@ -803,7 +817,7 @@
   let clock = 0; // 全フェイズで進む描画用の時計
   // 敵だるまの見た目：落下のずれ（負 = 論理位置より上に描く）、着地の縮み、傾き、投げの前のめり
   const daruma = { dispDy: 0, holdUntil: 0, vel: 0, squash: 0, tilt: 0, lunge: 0 };
-  const blowing = []; // 奥へ吹っ飛んでいる段 { cx, cy, color, cracks, hits, id, age }
+  const blowing = []; // 奥へ吹っ飛んでいる段 { cx, cy, kind, w, color, pattern, cracks, hits, maxHp, id, age }
   const puffs = []; // 土煙 { x, y, vx, vy, r, age, dur }
   const lastPunch = [null, null]; // 手ごとの直近の拳 { tx, ty, start }
   const whiffs = [null, null]; // 手ごとの届かない拳 { tx, ty, reach, start }。時間停止中に動くので lastPunch とは別に持つ
@@ -830,8 +844,10 @@
   function segTop(i) {
     return TABLE_Y - SEG_H * (i + 1);
   }
+  // 段 i の論理的な箱。幅はその段自身の w（段ごとに違う）
   function segRect(i) {
-    return { x: CENTER_X - SEG_W / 2, y: segTop(i), w: SEG_W, h: SEG_H };
+    const w = segments[i].w;
+    return { x: CENTER_X - w / 2, y: segTop(i), w, h: SEG_H };
   }
   function darumaGeom() {
     const g = enemyView.geom();
@@ -875,10 +891,13 @@
     const rng = mulberry32(hash3(turn, 7919, 13));
     // 出現位置は「塔の内側」と「塔の外側（左右の余白）」に分けて引く。
     // 毎ターン、外側にもおおよそ半分が散る形にして、迎撃（左右）と攻撃（中央）の場所を分ける。
+    // 内側／外側の判定は、いま戦っている一番下の段の幅が基準（段の左右の端の内側にある列が内側。端の上の列も内側に含める）。
+    // 段が無い最終段階は基準の幅 SEG_W で判定する。出現位置の列そのもの（x = 90, 290, 480, 670, 870）は固定
+    const half = (segments.length ? segments[0].w : SEG_W) / 2;
     const inSlots = [];
     const outSlots = [];
     for (const x of [90, 290, 480, 670, 870]) for (const y of [60, 262, 470]) {
-      if (x < 170 || x > 790) outSlots.push({ x, y });
+      if (x < CENTER_X - half || x > CENTER_X + half) outSlots.push({ x, y });
       else inSlots.push({ x, y });
     }
     const shuffle = (arr) => {
@@ -935,18 +954,23 @@
     segments = [];
     const hold = clock + INTRO_HOLD_MS;
     for (let i = 0; i < SEGMENT_COUNT; i++) {
-      const kind = LEVEL_KINDS[i];
-      const maxHp = kind === 'hard' ? SEG_HP_HARD : SEG_HP_FRAGILE;
-      const pattern = kind === 'hard' ? null : makeLogPattern(hash3(battleNo, i + 1, 977));
+      const def = LEVEL[i];
+      const kind = def.kind;
+      const pattern = kind === 'hard' ? null : makeLogPattern(hash3(battleNo, i + 1, 977), def.w, def.tone);
+      // 初期 hp が maxHp より低い段は、その差だけ最初から殴られている扱いにする（打数とヒビを先に入れておく。2 段目の hp 4 / maxHp 5）
+      const hits = def.maxHp - def.hp;
+      const cracks = [];
+      for (let n = 1; n <= hits; n++) cracks.push(generateSegCrack(i + 1, n, def.w));
       segments.push({
         id: i + 1,
         kind,
-        hp: maxHp,
-        maxHp,
-        hits: 0,
+        w: def.w,
+        hp: def.hp,
+        maxHp: def.maxHp,
+        hits,
         color: kind === 'hard' ? HARD_COLOR : pattern.base, // 脆い段の色は模様のベース色相（破片の色にも使う）
         pattern,
-        cracks: [],
+        cracks,
         jolt: 0,
         dispDy: -SEG_H,
         holdUntil: hold,
@@ -1090,14 +1114,14 @@
     const hand = punchCount % 2;
     punchCount += 1;
     const r = segRect(idx);
-    // 拳の着弾点：手の側に寄せた段の面（巨大な段なので中心から幅の 1/4 ほど外へ）
-    const tx = r.x + r.w / 2 + (hand === 0 ? -1 : 1) * SEG_W * 0.24;
+    // 拳の着弾点：手の側に寄せた段の面（巨大な段なので中心からその段の幅の 1/4 ほど外へ）
+    const tx = r.x + r.w / 2 + (hand === 0 ? -1 : 1) * r.w * 0.24;
     const ty = r.y + r.h / 2 + seg.dispDy;
     lastPunch[hand] = { tx, ty, start: clock };
 
     seg.hits += 1;
     seg.hp = Math.max(0, seg.hp - 1);
-    seg.cracks.push(generateSegCrack(seg.id, seg.hits));
+    seg.cracks.push(generateSegCrack(seg.id, seg.hits, seg.w));
     seg.jolt = 1;
     daruma.tilt += (hand === 0 ? 1 : -1) * 0.05;
 
@@ -1115,7 +1139,7 @@
     const v = segVisual(idx);
     segments.splice(idx, 1);
     removed += 1;
-    blowing.push({ cx: CENTER_X, cy: v.cy, kind: seg.kind, color: seg.color, pattern: seg.pattern, cracks: seg.cracks, hits: seg.hits, maxHp: seg.maxHp, id: seg.id, age: 0 });
+    blowing.push({ cx: CENTER_X, cy: v.cy, kind: seg.kind, w: seg.w, color: seg.color, pattern: seg.pattern, cracks: seg.cracks, hits: seg.hits, maxHp: seg.maxHp, id: seg.id, age: 0 });
     const hold = clock + BLOW_MS;
     for (let j = idx; j < segments.length; j++) {
       const s = segments[j];
@@ -1135,7 +1159,7 @@
     replayPause = Math.max(replayPause, BLOW_PAUSE_MS);
 
     if (!segments.length) {
-      // 最後の段。だるまは画面の上端の外（足元 y = -30）から台へ 500 落ちてくる。着地したら最終段階（本体を殴る）へ
+      // 最後の段。だるまは画面の上端の外（足元 y = -30）から台へ 500 落ちてくる（留まり BLOW_MS ＋ 落下 FALL_MS）。着地したら最終段階（本体を殴る）へ
       phase = 'finish';
       phaseTimer = 0;
       for (const p of projectiles) p.alive = false;
@@ -1166,7 +1190,7 @@
     }
   }
 
-  // 着地。巨大な段が 500 落ちてくる重さに釣り合うよう、揺れと土煙は大きく。だるまの着地（big）はさらに大きく
+  // 着地。巨大な段が 500 落ちてくる重さに釣り合うよう、揺れと土煙は大きく（落下を FALL_MS = 300 に速めたぶん揺れを強めている）。だるまの着地（big）はさらに大きく
   function onLand(o, isDaruma) {
     const big = isDaruma && phase === 'finish';
     if (isDaruma) {
@@ -1181,8 +1205,8 @@
       o.bounce = 1;
       const i = segments.indexOf(o);
       const r = segRect(i);
-      spawnPuffs(CENTER_X, r.y + r.h, 22, SEG_W * 0.5, 2.2);
-      shake(300, 14);
+      spawnPuffs(CENTER_X, r.y + r.h, 22, r.w * 0.5, 2.2);
+      shake(380, 16);
       // 導入：一番下の段が台に着いたら導入を終える（上の段とだるまも同時に着いている）
       if (i === 0) finishIntro();
     }
@@ -1581,7 +1605,7 @@
       }
       if (replayPause <= 0 && replayIdx >= queue.length && phaseTimer >= replayDuration) beginImpact();
     } else if (phase === 'finish') {
-      // だるまが画面の外から台へ落ちてくる（宙に留まる BLOW_MS ＋ 落下 FALL_MS ≒ 1 秒）。通常は着地（onLand）で最終段階に入る
+      // だるまが画面の外から台へ落ちてくる（宙に留まる BLOW_MS ＋ 落下 FALL_MS ≒ 0.65 秒）。通常は着地（onLand）で最終段階に入る
       phaseTimer += dt;
       if (phaseTimer > BLOW_MS + FALL_MS + 1500) enterFinale(); // 保険
     } else if (phase === 'impact') {
@@ -1733,9 +1757,9 @@
     ctx.lineTo(x0 + TABLE_W - 14, TABLE_Y + 14);
     ctx.stroke();
     // 塔の影（天板の上）。一番下の段がまだ落ちてくる途中なら、近づくにつれて影が広がる（導入で「上から来る」合図になる）。
-    // 段の幅に合わせて少し広く、接地の ∪ の弧（中央で約 10px 下がる）の周りに覗く厚みにする
+    // 一番下の段の幅に合わせて少し広く、接地の ∪ の弧（中央で約 10px 下がる）の周りに覗く厚みにする。太い段（700）でも天板の外には出さない
     if (phase !== 'title') {
-      let sw = segments.length ? SEG_W * 0.56 : DARUMA_W * 0.5;
+      let sw = segments.length ? Math.min(segments[0].w * 0.56, TABLE_W / 2 - 8) : DARUMA_W * 0.5;
       if (segments.length && segments[0].dispDy < 0) sw *= clamp(1 + segments[0].dispDy / SEG_H, 0.3, 1);
       ctx.fillStyle = 'rgba(42, 37, 34, 0.22)';
       ctx.beginPath();
@@ -1745,37 +1769,38 @@
     ctx.restore();
   }
 
-  // ---- 丸太（輪切り）の幾何 ----
+  // ---- 丸太（輪切り）の幾何。R はその段の半径（幅 / 2）で、段ごとに違う ----
   // 高さ y にある輪切りの縁（円）の見かけの膨らみ。正 = 上に膨らむ ∩（水平線より上の円を見上げる）、負 = 下に膨らむ ∪（水平線より下）。
-  // 膨らみ = 水平線からの距離 ÷ 1000 × 半径、上限は半径の 0.35 倍。静止時の下端（y=470）で約 10px、落下開始時（下端 y≈0）で約 108px
-  function arcBulge(y) {
-    return clamp(((HORIZON_Y - y) / 1000) * SEG_R, -ARC_MAX, ARC_MAX);
+  // 膨らみ = 水平線からの距離 ÷ 1000 × 半径、上限は半径の 0.35 倍。基準の幅 620 では静止時の下端（y=470）で約 10px、落下開始時（下端 y≈0）で約 108px
+  function arcBulge(y, R) {
+    const max = R * ARC_RATIO;
+    return clamp(((HORIZON_Y - y) / 1000) * R, -max, max);
   }
   // 縁の弧の、x の位置での y（弧の両端は y、中央は y - bulge）
-  function arcY(x, y, bulge) {
-    const u = clamp(x / SEG_R, -1, 1);
+  function arcY(x, y, bulge, R) {
+    const u = clamp(x / R, -1, 1);
     return y - bulge * Math.sqrt(1 - u * u);
   }
   // 現在のパス位置（弧の端）から、高さ y の縁の弧を反対の端まで辿る（楕円の半分）
-  function traceArc(ctx, y, bulge, leftToRight) {
+  function traceArc(ctx, R, y, bulge, leftToRight) {
     const ry = Math.max(0.01, Math.abs(bulge));
     const up = bulge >= 0;
-    if (leftToRight) ctx.ellipse(0, y, SEG_R, ry, 0, Math.PI, up ? TAU : 0, !up);
-    else ctx.ellipse(0, y, SEG_R, ry, 0, 0, up ? -Math.PI : Math.PI, up);
+    if (leftToRight) ctx.ellipse(0, y, R, ry, 0, Math.PI, up ? TAU : 0, !up);
+    else ctx.ellipse(0, y, R, ry, 0, 0, up ? -Math.PI : Math.PI, up);
   }
   // 段の側面の輪郭（中心を原点）。左右は垂直、上端と下端は縁の弧。角丸は使わない（円柱の縁と側面が出合う角は鋭い）
-  function segOutline(ctx, bt, bb) {
+  function segOutline(ctx, R, bt, bb) {
     ctx.beginPath();
-    ctx.moveTo(-SEG_R, -SEG_H / 2);
-    traceArc(ctx, -SEG_H / 2, bt, true);
-    ctx.lineTo(SEG_R, SEG_H / 2);
-    traceArc(ctx, SEG_H / 2, bb, false);
+    ctx.moveTo(-R, -SEG_H / 2);
+    traceArc(ctx, R, -SEG_H / 2, bt, true);
+    ctx.lineTo(R, SEG_H / 2);
+    traceArc(ctx, R, SEG_H / 2, bb, false);
     ctx.closePath();
   }
-  function edgeArcPath(ctx, y, bulge) {
+  function edgeArcPath(ctx, R, y, bulge) {
     ctx.beginPath();
-    ctx.moveTo(-SEG_R, y);
-    traceArc(ctx, y, bulge, true);
+    ctx.moveTo(-R, y);
+    traceArc(ctx, R, y, bulge, true);
   }
 
   // 中心線 pts（y が単調増加の折れ線）に沿って幅 2×halfW の帯を塗る。taperStart / taperEnd の端は 18px かけて細く消える
@@ -1807,11 +1832,11 @@
     ctx.fill();
   }
 
-  // 樹皮の静的な模様を描く（段の中心を原点。範囲は x ∈ [-SEG_R, SEG_R]、y ∈ [-SEG_H/2 - LOG_TEX_EXT, SEG_H/2 + LOG_TEX_EXT]）。
+  // 樹皮の静的な模様を描く（段の中心を原点。範囲は x ∈ [-pat.R, pat.R]、y ∈ [-SEG_H/2 - LOG_TEX_EXT, SEG_H/2 + LOG_TEX_EXT]）。
   // 順番：ベース → 色むら → 左右の円柱陰影 → 副筋 → 主筋 → 剥がれ → 節 → 苔 → 点描。年輪は側面には描かない（枝の切り株だけ）
   function drawBarkTexture(ctx, pat) {
-    const R = SEG_R;
-    const w = SEG_W;
+    const R = pat.R;
+    const w = pat.w;
     const h = SEG_H;
     const y0 = -h / 2 - LOG_TEX_EXT;
     const th = h + 2 * LOG_TEX_EXT;
@@ -1976,9 +2001,9 @@
       ctx.ellipse(m.x, m.y, m.rx, m.ry, 0, 0, TAU);
       ctx.fill();
     }
-    // 点描（ざらつき）：暗・明半々
+    // 点描（ざらつき）：暗・明半々。数は段の幅に比例させる（基準の幅 620 で 480〜540）
     const srng = mulberry32(pat.stippleSeed);
-    const n = 480 + Math.floor(srng() * 60);
+    const n = Math.round((480 + Math.floor(srng() * 60)) * (w / SEG_W));
     for (let i = 0; i < n; i++) {
       const x = -R + srng() * w;
       const y = y0 + srng() * th;
@@ -1992,7 +2017,7 @@
     const k = Math.min(viewK, 3);
     if (pat.tex && pat.texK === k) return pat.tex;
     const c = pat.tex || document.createElement('canvas');
-    const w = SEG_W;
+    const w = pat.w;
     const th = SEG_H + 2 * LOG_TEX_EXT;
     c.width = Math.max(1, Math.ceil(w * k));
     c.height = Math.max(1, Math.ceil(th * k));
@@ -2009,7 +2034,7 @@
   // yTop / hh は段階 1 以上で全体を暗くする範囲（輪郭のはみ出しも覆う）
   function drawSegCracks(ctx, seg, yTop, hh) {
     if (!seg.cracks.length) return;
-    const w = SEG_W;
+    const w = seg.w;
     const stage = stageOf(Math.min(seg.hits, seg.maxHp - 1), seg.maxHp);
     const lenMul = [0.45, 0.8, 1.2][stage];
     const lw = [3.5, 5.5, 8][stage];
@@ -2042,7 +2067,7 @@
   // 落下中の段の底面（木口）。段の中心を原点、下端 y = SEG_H/2 を中心にした横幅いっぱいの楕円（縦半径 bb = 下端の弧の膨らみ）。
   // 影の中なので暗い茶に薄い年輪。着地に近づくほど潰れて消える。側面より先に描き、下の段の側面がこの上に重なる
   function drawLogFace(ctx, pat, bb) {
-    const R = SEG_R;
+    const R = pat.R;
     const y = SEG_H / 2;
     ctx.save();
     ctx.beginPath();
@@ -2075,13 +2100,13 @@
   // 脆い段＝縦に立つ丸太の側面（段の中心を原点）。bt / bb は上端・下端の弧の膨らみ。
   // 焼いた模様を輪郭で切り抜き、その上に上の段が落とす暗がり・接地の影・切り縁の帯・縁の欠け・ヒビを描き、墨の輪郭で締める
   function drawLogSide(ctx, seg, bt, bb) {
-    const R = SEG_R;
-    const w = SEG_W;
+    const w = seg.w;
+    const R = w / 2;
     const h = SEG_H;
     const ext = LOG_TEX_EXT;
-    if (!seg.pattern) seg.pattern = makeLogPattern(hash3(seg.id || 0, 0, 977)); // 保険（通常は生成時のものを使う）
+    if (!seg.pattern) seg.pattern = makeLogPattern(hash3(seg.id || 0, 0, 977), w, null); // 保険（通常は生成時のものを使う）
     const pat = seg.pattern;
-    segOutline(ctx, bt, bb);
+    segOutline(ctx, R, bt, bb);
     ctx.save();
     ctx.clip();
     ctx.drawImage(barkTexture(pat), -R, -h / 2 - ext, w, h + 2 * ext);
@@ -2105,17 +2130,17 @@
     ]) {
       ctx.strokeStyle = LOG_EDGE_LIGHT;
       ctx.lineWidth = 3;
-      edgeArcPath(ctx, y + dir * 1.5, b);
+      edgeArcPath(ctx, R, y + dir * 1.5, b);
       ctx.stroke();
       ctx.strokeStyle = LOG_EDGE_DARK;
       ctx.lineWidth = 2;
-      edgeArcPath(ctx, y + dir * 4, b);
+      edgeArcPath(ctx, R, y + dir * 4, b);
       ctx.stroke();
     }
     // 縁から垂れる欠け：鋸で切ったときに樹皮が欠けた表現（淡い木色の半楕円）
     ctx.fillStyle = 'rgba(226, 199, 150, 0.8)';
     for (const c of pat.chips) {
-      const ay = c.top ? arcY(c.x, -h / 2, bt) : arcY(c.x, h / 2, bb);
+      const ay = c.top ? arcY(c.x, -h / 2, bt, R) : arcY(c.x, h / 2, bb, R);
       ctx.beginPath();
       if (c.top) ctx.ellipse(c.x, ay, c.w / 2, c.d, 0, 0, Math.PI);
       else ctx.ellipse(c.x, ay, c.w / 2, c.d, 0, Math.PI, TAU);
@@ -2125,13 +2150,13 @@
     ctx.restore();
     ctx.lineWidth = 5;
     ctx.strokeStyle = WA.sumi;
-    segOutline(ctx, bt, bb);
+    segOutline(ctx, R, bt, bb);
     ctx.stroke();
   }
 
-  // 硬い段＝暗い石に金属の帯（段の中心を原点。見た目は従来のまま、角丸の長方形）
+  // 硬い段＝暗い石に金属の帯（段の中心を原点。見た目は従来のまま、角丸の長方形。幅はその段の w）
   function drawStoneBody(ctx, seg) {
-    const w = SEG_W;
+    const w = seg.w;
     const h = SEG_H;
     const corner = 16;
     ctx.lineWidth = 5;
@@ -2179,14 +2204,15 @@
     ctx.stroke();
   }
 
-  // 段の本体。中心を原点に描く。seg は { kind, color, pattern, cracks, hits, maxHp } を持つ。
-  // topY / bottomY は段の上端・下端の画面上の高さ（縮みや回転をかける前の値）。脆い段の縁の弧の膨らみをこれで決める
+  // 段の本体。中心を原点に描く。seg は { kind, w, color, pattern, cracks, hits, maxHp } を持つ。
+  // topY / bottomY は段の上端・下端の画面上の高さ（縮みや回転をかける前の値）。脆い段の縁の弧の膨らみをこれと段の半径で決める
   function drawSegmentBody(ctx, seg, topY, bottomY) {
     if (seg.kind === 'hard') {
       drawStoneBody(ctx, seg);
       return;
     }
-    drawLogSide(ctx, seg, arcBulge(topY), arcBulge(bottomY));
+    const R = seg.w / 2;
+    drawLogSide(ctx, seg, arcBulge(topY, R), arcBulge(bottomY, R));
   }
 
   // 奥へ吹っ飛ぶ段：一点（CENTER_X, VANISH_Y）へ縮みながら上がって消える。塔より奥に描く。
@@ -2218,7 +2244,7 @@
       if (i > 0 && segments[i - 1].dispDy <= s.dispDy + 0.5) continue; // 下の段と一緒に落ちている（隙間なし）
       const v = segVisual(i);
       const bottomY = v.cy + SEG_H / 2;
-      const bb = arcBulge(bottomY);
+      const bb = arcBulge(bottomY, s.w / 2);
       if (bb <= 0.5 || bottomY + bb + 8 < 0) continue;
       ctx.save();
       ctx.translate(v.cx, v.cy);
