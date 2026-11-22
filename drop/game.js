@@ -91,7 +91,7 @@
   const FALL_MS = 300; // 一段分（SEG_H）を落ち切るまでの目安。約 300ms かけて加速して落ちる（落ち始めが遅く、着地直前に最速）
   const FALL_G = (2 * SEG_H) / (FALL_MS * FALL_MS); // 落下の加速（px/ms²）。静止から FALL_MS で SEG_H 落ちる
   const BOUNCE_MS = 220; // 着地の縮み（重い段なので跳ねずに潰れる）
-  const BLOW_PAUSE_MS = 800; // 吹っ飛びのあと、拳の再生を止めて見せ場を読ませる時間（吹っ飛び BLOW_MS ＋ 落下 FALL_MS ＋ 着地）
+  const BLOW_PAUSE_MS = 800; // 殴り終わって段が吹っ飛んだあとの見せ場の長さ（吹っ飛び BLOW_MS ＋ 落下 FALL_MS ＋ 着地の余韻）。この間は次のターンへ進まない
   const VANISH_Y = 140; // 吹っ飛ぶ段が吸い込まれる一点の高さ（x は塔の中心）
 
   const ATTACK_MS = 450; // 飛来物が塔から出て止まるまでの時間（400 未満にはしない。目で追えずワープに見えるため）
@@ -887,7 +887,7 @@
   let replayIdx = 0;
   let replayDuration = 0;
   let replayTotal = 0;
-  let replayPause = 0; // 吹っ飛びの見せ場のあいだ拳の再生を止める残り時間
+  let replayPause = 0; // 殴り終わって段が吹っ飛んだあとの見せ場の残り時間（この間はターン終了を待つ）
   let missTimer = 0; // 再生開始からの経過（ms）。漏れた飛来物の飛び込みに使う。replayPause の間も止めない（落下も再開した時間の中で起きている）
   let punchCount = 0; // 再生の中で何本目の拳か（手を交互に）
   let resultShown = false;
@@ -915,6 +915,7 @@
   let flash = null; // { color, alpha }
   let banner = null; // { text, age, color }
   let playerSquash = 0;
+  let playerHitT = 9999; // 最後の被弾からの経過ミリ秒（のけぞりと目盛りの跳ねに使う）
   let boomCount = 0;
   let fireworkTimer = 0;
   let fireworksLeft = 0;
@@ -1094,6 +1095,7 @@
     flash = null;
     banner = null;
     playerSquash = 0;
+    playerHitT = 9999;
     boomCount = 0;
     fireworksLeft = 0;
     replayPause = 0;
@@ -1224,7 +1226,7 @@
     daruma.tilt += clamp(rx / (DARUMA_W / 2), -1, 1) * -0.06;
     shake(90, 3 + 3 * p);
     sound.punch(p);
-    if (darumaHits >= DARUMA_HP) killDaruma();
+    // 本体も段と同じく、その場では砕けない。砕けるのは予約した拳を全部打ち終わったあと（update の replay 節）
   }
 
   // 段 idx を殴る。耐久を 1 減らし、ヒビを足す。尽きたら吹っ飛ぶ
@@ -1249,7 +1251,7 @@
     shake(90, 3 + 3 * p);
     sound.knock(p);
 
-    if (seg.hp <= 0) blowSegment(idx);
+    // 耐久が尽きても、その場では吹っ飛ばない。吹っ飛ぶのは予約した拳を全部打ち終わったあと（update の replay 節）
   }
 
   // 段 idx が奥へ吹っ飛ぶ。上の段とだるまは一段分（SEG_H = 500）落ちる（BLOW_MS の間だけ宙に留まってから、約 FALL_MS かけて加速して落ちる）
@@ -1346,7 +1348,11 @@
     playerView.cracks.push(generateCrack(playerView, Math.cos(a) * r, Math.sin(a) * r, playerHits));
     playerView.stage = stageOf(playerHits, PLAYER_HP);
     playerView.dirty = true;
-    playerSquash = 0.2;
+    // 当たった場所に破裂を出す（飛来物はカメラ側へ抜けるので、自だるまの上に当たりの絵を作る）
+    impacts.push({ x: PLAYER_CX, y: PLAYER_CY, age: 0, dur: 280, size: 44, color: WA.shu });
+    spawnShards(PLAYER_CX, PLAYER_CY, ['#c8311c', '#fffcf5', WA.sumi], 12, 36);
+    playerSquash = 0.3;
+    playerHitT = 0;
     shake(260, 14);
     flash = { color: '217, 72, 43', alpha: 0.55 };
     sound.hurt();
@@ -1653,6 +1659,7 @@
       if (flash.alpha <= 0) flash = null;
     }
     playerSquash *= Math.pow(0.001, dt / 260);
+    playerHitT += dt;
     // 勝利の花火と花びら
     if (phase === 'win') {
       if (fireworksLeft > 0) {
@@ -1722,6 +1729,13 @@
       }
       const pending = stepMisses(f);
       if (phase !== 'replay') return; // 被弾で自だるまが割れた（敗北）
+      // 壊れるのは殴り終わったあと。予約を全部打ち切った時点で、耐久の尽きた段を吹っ飛ばす（本体も同じく、ここで砕く）
+      if (replayPause <= 0 && replayIdx >= queue.length) {
+        const bi = segments.findIndex((s) => s.hp <= 0);
+        if (bi >= 0) blowSegment(bi);
+        else if (finale && darumaAlive && darumaHits >= DARUMA_HP) killDaruma();
+        if (phase !== 'replay') return; // 最後の段が吹っ飛んだ（最終段階へ）か、本体が砕けた（勝ち）
+      }
       // 拳を打ち切り、漏れた飛来物も全部解決したらターン終了（拳が空でも飛来物が残っていれば待つ）
       if (replayPause <= 0 && replayIdx >= queue.length && phaseTimer >= replayDuration && !pending) endTurn();
     } else if (phase === 'finish') {
@@ -2442,7 +2456,11 @@
     if (!playerAlive) return;
     const g = playerView.geom();
     const bottom = PLAYER_CY + g.artH / 2;
+    // 被弾ののけぞり：400ms かけて線形に戻る。左下へ押し戻される（最大 x −10、y ＋5）
+    const HIT_RECOIL_MS = 400;
+    const recoil = playerHitT < HIT_RECOIL_MS ? 1 - playerHitT / HIT_RECOIL_MS : 0;
     ctx.save();
+    ctx.translate(-10 * recoil, 5 * recoil);
     ctx.translate(PLAYER_CX, bottom);
     ctx.scale(1 + playerSquash, 1 - playerSquash);
     ctx.translate(-PLAYER_CX, -bottom);
@@ -2454,9 +2472,18 @@
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
     ctx.fillText('自分', PLAYER_CX - PLAYER_W / 2, PLAYER_CY - PLAYER_W / 2 - 26);
+    const justLost = PLAYER_HP - playerHits; // いま減ったばかりの目盛りのインデックス（残り目盛りの直後）
     for (let i = 0; i < PLAYER_HP; i++) {
+      const mx = PLAYER_CX - PLAYER_W / 2 + 34 + i * 10;
+      const my = PLAYER_CY - PLAYER_W / 2 - 22;
+      if (i === justLost && playerHits > 0 && playerHitT < 300) {
+        // 減ったばかりの1目盛りだけ、300ms の間は大きく明るい赤で跳ねさせる
+        ctx.fillStyle = '#ff4a2a';
+        ctx.fillRect(mx - 2, my - 2, 11, 13);
+        continue;
+      }
       ctx.fillStyle = i < PLAYER_HP - playerHits ? WA.shu : 'rgba(42, 37, 34, 0.25)';
-      ctx.fillRect(PLAYER_CX - PLAYER_W / 2 + 34 + i * 10, PLAYER_CY - PLAYER_W / 2 - 22, 7, 9);
+      ctx.fillRect(mx, my, 7, 9);
     }
   }
 
